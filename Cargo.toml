@@ -1,0 +1,25 @@
+[package]
+name = "hoshikv_thermal"
+version = "2.0.0"
+edition = "2021"
+description = "hoshikv-thermal: ColorOS-style thermal engine + IThermal AIDL HAL for Redmi Turbo 3 (peridot) by hoshikv"
+
+[[bin]]
+name = "hoshikv-thermal"
+path = "src/main.rs"
+
+[dependencies]
+rsbinder = { version = "0.10", default-features = false }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+rsbinder-aidl = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
