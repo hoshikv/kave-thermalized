@@ -16,41 +16,21 @@
 
 package android.hardware.thermal;
 
-/**
- * Device throttling severity
- * @hide
- */
 @VintfStability
 @Backing(type="int")
 enum ThrottlingSeverity {
-    /**
-     * Not under throttling.
-     */
+
     NONE = 0,
-    /**
-     * Light throttling where UX is not impacted.
-     */
+
     LIGHT,
-    /**
-     * Moderate throttling where UX is not largely impacted.
-     */
+
     MODERATE,
-    /**
-     * Severe throttling where UX is largely impacted.
-     * Similar to 1.0 throttlingThreshold.
-     */
+
     SEVERE,
-    /**
-     * Platform has done everything to reduce power.
-     */
+
     CRITICAL,
-    /**
-     * Key components in platform are shutting down due to thermal condition.
-     * Device functionalities will be limited.
-     */
+
     EMERGENCY,
-    /**
-     * Need shutdown immediately.
-     */
+
     SHUTDOWN,
 }

@@ -221,17 +221,6 @@ impl Tuner {
         active
     }
 
-    /*
-     * Freq capping is driven by temperature only.
-     *
-     * There used to be a second trigger: screen-off forced `gated` on and
-     * picked a lower per-policy `doze_freq_*` target. On this device that
-     * parked policy0 at 1.11 MHz while the screen was dark, so the next FOD
-     * wake had to re-ramp from there and the transition stuttered. Drop
-     * cache, the app freezer and the bg appops quarantine had the same
-     * effect for the same reason (cold launcher/SystemUI on wake) and are
-     * gone as well. Screen state no longer reaches this tuner at all.
-     */
     pub fn apply(&mut self, elapsed_secs: u64, virtual_temp: i32) {
         self.boot_active_check(elapsed_secs);
         if elapsed_secs % self.enforce_every != 0 {

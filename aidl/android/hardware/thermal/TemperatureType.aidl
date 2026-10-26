@@ -16,10 +16,6 @@
 
 package android.hardware.thermal;
 
-/**
- * Device temperature types
- * @hide
- */
 @VintfStability
 @Backing(type="int")
 enum TemperatureType {
@@ -30,15 +26,11 @@ enum TemperatureType {
     SKIN = 3,
     USB_PORT = 4,
     POWER_AMPLIFIER = 5,
-    /**
-     * Battery Current Limit - virtual sensors
-     */
+
     BCL_VOLTAGE = 6,
     BCL_CURRENT = 7,
     BCL_PERCENTAGE = 8,
-    /**
-     * Neural Processing Unit
-     */
+
     NPU = 9,
     TPU = 10,
     DISPLAY = 11,

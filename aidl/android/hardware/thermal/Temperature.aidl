@@ -19,30 +19,15 @@ package android.hardware.thermal;
 import android.hardware.thermal.TemperatureType;
 import android.hardware.thermal.ThrottlingSeverity;
 
-/* @hide */
 @VintfStability
 @JavaDerive(toString=true)
 parcelable Temperature {
-    /**
-     * This temperature's type.
-     */
+
     TemperatureType type;
-    /**
-     * Name of this temperature matching the TemperatureThreshold.
-     * All temperatures of the same "type" must have a different "name",
-     * e.g., cpu0, battery. Clients use it to match with TemperatureThreshold
-     * struct.
-     */
+
     String name;
-    /**
-     * For BCL, this is the current reading of the virtual sensor and the unit is
-     * millivolt, milliamp, percentage for BCL_VOLTAGE, BCL_CURRENT and BCL_PERCENTAGE
-     * respectively. For everything else, this is the current temperature in Celsius.
-     * If not available set by HAL to NAN.
-     */
+
     float value;
-    /**
-     * The current throttling level of the sensor.
-     */
+
     ThrottlingSeverity throttlingStatus;
 }

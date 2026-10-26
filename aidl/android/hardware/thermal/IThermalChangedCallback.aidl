@@ -18,18 +18,8 @@ package android.hardware.thermal;
 
 import android.hardware.thermal.Temperature;
 
-/**
- * IThermalChangedCallback send throttling notification to clients.
- * @hide
- */
 @VintfStability
 interface IThermalChangedCallback {
-    /**
-     * Send a thermal throttling event to all ThermalHAL
-     * thermal event listeners.
-     *
-     * @param temperature The temperature associated with the
-     *    throttling event.
-     */
+
     oneway void notifyThrottling(in Temperature temperature);
 }
