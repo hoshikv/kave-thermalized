@@ -24,7 +24,7 @@ struct CallbackEntry {
 type Strong<T> = rsbinder::Strong<T>;
 
 #[derive(Default)]
-struct CallbackRegistry {
+pub(crate) struct CallbackRegistry {
     entries: Mutex<Vec<CallbackEntry>>,
 }
 
@@ -32,7 +32,7 @@ pub struct SharedState {
     pub temperatures: RwLock<Vec<Temperature>>,
     pub thresholds: Vec<TemperatureThreshold>,
     pub cooling_devices: RwLock<Vec<CoolingDevice>>,
-    pub callbacks: CallbackRegistry,
+    pub(crate) callbacks: CallbackRegistry,
 }
 
 impl SharedState {
@@ -105,27 +105,132 @@ enum SensorKind {
 }
 
 static SPECS: &[SensorSpec] = &[
-    SensorSpec { name: "CPU0", ty: TemperatureType::CPU, kind: SensorKind::Zone("cpu-0-0-0"), hot: [70000, 80000, 90000, 98000, 105000, 115000] },
-    SensorSpec { name: "CPU1", ty: TemperatureType::CPU, kind: SensorKind::Zone("cpu-0-1-0"), hot: [70000, 80000, 90000, 98000, 105000, 115000] },
-    SensorSpec { name: "CPU2", ty: TemperatureType::CPU, kind: SensorKind::Zone("cpu-0-2-0"), hot: [70000, 80000, 90000, 98000, 105000, 115000] },
-    SensorSpec { name: "CPU3", ty: TemperatureType::CPU, kind: SensorKind::Zone("cpu-1-0-0"), hot: [70000, 80000, 90000, 98000, 105000, 115000] },
-    SensorSpec { name: "CPU4", ty: TemperatureType::CPU, kind: SensorKind::Zone("cpu-1-1-0"), hot: [70000, 80000, 90000, 98000, 105000, 115000] },
-    SensorSpec { name: "CPU5", ty: TemperatureType::CPU, kind: SensorKind::Zone("cpu-1-2-0"), hot: [70000, 80000, 90000, 98000, 105000, 115000] },
-    SensorSpec { name: "CPU6", ty: TemperatureType::CPU, kind: SensorKind::Zone("cpu-1-3-0"), hot: [70000, 80000, 90000, 98000, 105000, 115000] },
-    SensorSpec { name: "CPU7", ty: TemperatureType::CPU, kind: SensorKind::Zone("cpu-2-0-0"), hot: [70000, 80000, 90000, 98000, 105000, 115000] },
-    SensorSpec { name: "GPU0", ty: TemperatureType::GPU, kind: SensorKind::Zone("gpuss-0"), hot: [60000, 70000, 80000, 90000, 100000, 110000] },
-    SensorSpec { name: "GPU1", ty: TemperatureType::GPU, kind: SensorKind::Zone("gpuss-1"), hot: [60000, 70000, 80000, 90000, 100000, 110000] },
-    SensorSpec { name: "GPU2", ty: TemperatureType::GPU, kind: SensorKind::Zone("gpuss-2"), hot: [60000, 70000, 80000, 90000, 100000, 110000] },
-    SensorSpec { name: "GPU3", ty: TemperatureType::GPU, kind: SensorKind::Zone("gpuss-3"), hot: [60000, 70000, 80000, 90000, 100000, 110000] },
-    SensorSpec { name: "nsp0", ty: TemperatureType::NPU, kind: SensorKind::Zone("nsphvx-0"), hot: [65000, 75000, 85000, 95000, 105000, 115000] },
-    SensorSpec { name: "nsp1", ty: TemperatureType::NPU, kind: SensorKind::Zone("nsphvx-1"), hot: [65000, 75000, 85000, 95000, 105000, 115000] },
-    SensorSpec { name: "nsp2", ty: TemperatureType::NPU, kind: SensorKind::Zone("nsphmx-0"), hot: [65000, 75000, 85000, 95000, 105000, 115000] },
-    SensorSpec { name: "nsp3", ty: TemperatureType::NPU, kind: SensorKind::Zone("nsphmx-1"), hot: [65000, 75000, 85000, 95000, 105000, 115000] },
-    SensorSpec { name: "battery", ty: TemperatureType::BATTERY, kind: SensorKind::BatteryPs, hot: [43000, 45000, 48000, 50000, 52000, 55000] },
-    SensorSpec { name: "skin", ty: TemperatureType::SKIN, kind: SensorKind::VirtualSkin, hot: [46000, 50000, 54000, 58000, 62000, 66000] },
-    SensorSpec { name: "shell_skin", ty: TemperatureType::SKIN, kind: SensorKind::VirtualSkin, hot: [46000, 50000, 54000, 58000, 62000, 66000] },
-    SensorSpec { name: "socd", ty: TemperatureType::BCL_PERCENTAGE, kind: SensorKind::Socd, hot: [65000, 75000, 85000, 95000, 105000, 115000] },
-    SensorSpec { name: "vbat", ty: TemperatureType::BCL_VOLTAGE, kind: SensorKind::Vbat, hot: [4200, 4300, 4400, 4500, 4600, 4700] },
+    SensorSpec {
+        name: "CPU0",
+        ty: TemperatureType::CPU,
+        kind: SensorKind::Zone("cpu-0-0-0"),
+        hot: [70000, 80000, 90000, 98000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "CPU1",
+        ty: TemperatureType::CPU,
+        kind: SensorKind::Zone("cpu-0-1-0"),
+        hot: [70000, 80000, 90000, 98000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "CPU2",
+        ty: TemperatureType::CPU,
+        kind: SensorKind::Zone("cpu-0-2-0"),
+        hot: [70000, 80000, 90000, 98000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "CPU3",
+        ty: TemperatureType::CPU,
+        kind: SensorKind::Zone("cpu-1-0-0"),
+        hot: [70000, 80000, 90000, 98000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "CPU4",
+        ty: TemperatureType::CPU,
+        kind: SensorKind::Zone("cpu-1-1-0"),
+        hot: [70000, 80000, 90000, 98000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "CPU5",
+        ty: TemperatureType::CPU,
+        kind: SensorKind::Zone("cpu-1-2-0"),
+        hot: [70000, 80000, 90000, 98000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "CPU6",
+        ty: TemperatureType::CPU,
+        kind: SensorKind::Zone("cpu-1-3-0"),
+        hot: [70000, 80000, 90000, 98000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "CPU7",
+        ty: TemperatureType::CPU,
+        kind: SensorKind::Zone("cpu-2-0-0"),
+        hot: [70000, 80000, 90000, 98000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "GPU0",
+        ty: TemperatureType::GPU,
+        kind: SensorKind::Zone("gpuss-0"),
+        hot: [60000, 70000, 80000, 90000, 100000, 110000],
+    },
+    SensorSpec {
+        name: "GPU1",
+        ty: TemperatureType::GPU,
+        kind: SensorKind::Zone("gpuss-1"),
+        hot: [60000, 70000, 80000, 90000, 100000, 110000],
+    },
+    SensorSpec {
+        name: "GPU2",
+        ty: TemperatureType::GPU,
+        kind: SensorKind::Zone("gpuss-2"),
+        hot: [60000, 70000, 80000, 90000, 100000, 110000],
+    },
+    SensorSpec {
+        name: "GPU3",
+        ty: TemperatureType::GPU,
+        kind: SensorKind::Zone("gpuss-3"),
+        hot: [60000, 70000, 80000, 90000, 100000, 110000],
+    },
+    SensorSpec {
+        name: "nsp0",
+        ty: TemperatureType::NPU,
+        kind: SensorKind::Zone("nsphvx-0"),
+        hot: [65000, 75000, 85000, 95000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "nsp1",
+        ty: TemperatureType::NPU,
+        kind: SensorKind::Zone("nsphvx-1"),
+        hot: [65000, 75000, 85000, 95000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "nsp2",
+        ty: TemperatureType::NPU,
+        kind: SensorKind::Zone("nsphmx-0"),
+        hot: [65000, 75000, 85000, 95000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "nsp3",
+        ty: TemperatureType::NPU,
+        kind: SensorKind::Zone("nsphmx-1"),
+        hot: [65000, 75000, 85000, 95000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "battery",
+        ty: TemperatureType::BATTERY,
+        kind: SensorKind::BatteryPs,
+        hot: [43000, 45000, 48000, 50000, 52000, 55000],
+    },
+    SensorSpec {
+        name: "skin",
+        ty: TemperatureType::SKIN,
+        kind: SensorKind::VirtualSkin,
+        hot: [46000, 50000, 54000, 58000, 62000, 66000],
+    },
+    SensorSpec {
+        name: "shell_skin",
+        ty: TemperatureType::SKIN,
+        kind: SensorKind::VirtualSkin,
+        hot: [46000, 50000, 54000, 58000, 62000, 66000],
+    },
+    SensorSpec {
+        name: "socd",
+        ty: TemperatureType::BCL_PERCENTAGE,
+        kind: SensorKind::Socd,
+        hot: [65000, 75000, 85000, 95000, 105000, 115000],
+    },
+    SensorSpec {
+        name: "vbat",
+        ty: TemperatureType::BCL_VOLTAGE,
+        kind: SensorKind::Vbat,
+        hot: [4200, 4300, 4400, 4500, 4600, 4700],
+    },
 ];
 
 fn compute_severity(value_mc: i32, hot: &[i32; 6]) -> i32 {

@@ -1,168 +1,281 @@
-use crate::sensors::Weights;
-use serde::Deserialize;
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-const DEFAULT_PATH: &str = "/vendor/etc/thermal_config.json";
-const FALLBACK_PATH: &str = "/data/vendor/thermal/thermal_config.json";
+use crate::crypto;
 
-#[allow(dead_code)]
-#[derive(Deserialize, Default)]
-pub struct ThermalConfig {
-    pub weights: Option<WeightCfg>,
-    pub cpu0: Option<PolicyCfg>,
-    pub cpu3: Option<PolicyCfg>,
-    pub cpu7: Option<PolicyCfg>,
-    pub gpu: Option<GpuCfg>,
-    pub battery: Option<BatteryCfg>,
-    pub hal: Option<HalCfg>,
-    pub power: Option<PowerCfg>,
-}
-
-#[allow(dead_code)]
-#[derive(Deserialize, Default, Clone)]
-pub struct PowerCfg {
-    pub max_freq_p0: Option<i32>,
-    pub max_freq_p3: Option<i32>,
-    pub max_freq_p6: Option<i32>,
-    pub max_freq_p7: Option<i32>,
-
-
-
-
-    pub boot_guard_s: Option<u64>,
-    pub boot_max_p0: Option<i32>,
-    pub boot_max_p3: Option<i32>,
-    pub boot_max_p6: Option<i32>,
-    pub boot_max_p7: Option<i32>,
-    pub governor: Option<String>,
-    pub swappiness: Option<i32>,
-    pub gate_temp: Option<i32>,
-    pub props: Option<Vec<PropCfg>>,
-    pub boost: Option<i32>,
-    pub dirty_ratio: Option<i32>,
-    pub dirty_bg: Option<i32>,
-}
-
-#[derive(Deserialize, Default, Clone)]
-pub struct PropCfg {
+#[derive(Clone, Debug)]
+pub struct Section {
     pub name: String,
-    pub value: String,
+    pub values: HashMap<String, String>,
 }
 
-#[derive(Deserialize, Default)]
-pub struct WeightCfg {
-    pub cpu: Option<i32>,
-    pub batt: Option<i32>,
-    pub chg: Option<i32>,
-    pub wifi: Option<i32>,
-    pub pa0: Option<i32>,
-    pub pa1: Option<i32>,
-    pub quiet: Option<i32>,
-    pub conn: Option<i32>,
-    pub hotspot: Option<i32>,
+impl Section {
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.values.get(key).map(|s| s.as_str())
+    }
+
+    pub fn ints(&self, key: &str) -> Vec<i64> {
+        self.get(key)
+            .map(|value| {
+                value
+                    .split_whitespace()
+                    .filter_map(|part| part.parse::<i64>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn int(&self, key: &str, default: i64) -> i64 {
+        self.get(key)
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(default)
+    }
+
+    pub fn words(&self, key: &str) -> Vec<String> {
+        self.get(key)
+            .map(|value| value.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn plus_words(&self, key: &str) -> Vec<String> {
+        self.get(key)
+            .map(|value| {
+                value
+                    .split('+')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
-#[derive(Deserialize, Default)]
-pub struct PolicyCfg {
-    pub trig: Option<Vec<i32>>,
-    pub clr: Option<Vec<i32>>,
-    pub targets: Option<Vec<i32>>,
+#[derive(Clone, Debug, Default)]
+pub struct ThermalConfig {
+    pub sections: Vec<Section>,
 }
 
-#[derive(Deserialize, Default)]
-pub struct GpuCfg {
-    pub trig: Option<Vec<i32>>,
-    pub clr: Option<Vec<i32>>,
-    pub freqs: Option<Vec<i32>>,
+#[derive(Clone, Debug)]
+pub struct DeviceConfig {
+    pub name: String,
+    pub cooling_name: Option<String>,
+    pub path: Option<PathBuf>,
+    pub def_target: i64,
+    pub select_higher: bool,
 }
 
-#[allow(dead_code)]
-#[derive(Deserialize, Default)]
-pub struct BatteryCfg {
-    pub limit_temps: Option<Vec<i32>>,
-    pub limit_currents: Option<Vec<i32>>,
-    pub restrict_level: Option<i32>,
-    pub suspend_level: Option<i32>,
-    pub clamp_temps: Option<Vec<i32>>,
-    pub clamp_currents: Option<Vec<i32>>,
+pub fn parse_thermal(text: &str) -> ThermalConfig {
+    let mut sections = Vec::new();
+    let mut current: Option<Section> = None;
 
-
-
-    pub boost_floor: Option<i32>,
-}
-
-#[allow(dead_code)]
-#[derive(Deserialize, Default)]
-pub struct HalCfg {
-    pub skin_hot: Option<Vec<i32>>,
-}
-
-impl ThermalConfig {
-    pub fn load() -> Self {
-        let try_load = |path: &str| -> Option<Self> {
-            let p = Path::new(path);
-            if !p.exists() {
-                return None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(end) = line.find(']') {
+                let name = line[1..end].trim().to_owned();
+                if let Some(section) = current.take() {
+                    sections.push(section);
+                }
+                current = Some(Section {
+                    name,
+                    values: HashMap::new(),
+                });
+                continue;
             }
-            let data = std::fs::read_to_string(p).ok()?;
-            serde_json::from_str(&data).ok()
+        }
+        if let Some(section) = current.as_mut() {
+            let split = line.find(char::is_whitespace).unwrap_or(line.len());
+            let key = line[..split].trim().to_owned();
+            let value = line[split..].trim().to_owned();
+            if !key.is_empty() {
+                section.values.insert(key, value);
+            }
+        }
+    }
+
+    if let Some(section) = current {
+        sections.push(section);
+    }
+
+    ThermalConfig { sections }
+}
+
+pub fn parse_thermal_map(text: &str) -> Vec<(i64, String)> {
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(inner) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        else {
+            continue;
         };
+        let Some((index, file)) = inner.split_once(':') else {
+            continue;
+        };
+        let Ok(index) = index.trim().parse::<i64>() else {
+            continue;
+        };
+        let file = file.trim();
+        if (0..0x801).contains(&index) && !file.is_empty() {
+            entries.push((index, file.to_owned()));
+        }
+    }
+    entries
+}
 
-        let mut cfg = try_load(FALLBACK_PATH)
-            .or_else(|| try_load(DEFAULT_PATH))
-            .unwrap_or_default();
+pub fn parse_region_map(text: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((version, file)) = line.split_once(':') else {
+            continue;
+        };
+        let version = version.trim();
+        let file = file.trim();
+        if !version.is_empty() && !file.is_empty() {
+            entries.push((version.to_owned(), file.to_owned()));
+        }
+    }
+    entries
+}
 
-        let stale = cfg.power.is_none() && cfg.cpu0.is_none() && cfg.battery.is_none();
-        if stale {
-            let seed = f5mimic_config_json();
-            let _ = std::fs::create_dir_all("/data/vendor/thermal");
-            if std::fs::write(FALLBACK_PATH, seed.as_bytes()).is_ok() {
-                let _ = std::fs::set_permissions(
-                    FALLBACK_PATH,
-                    std::os::unix::fs::PermissionsExt::from_mode(0o644),
-                );
-                cfg = serde_json::from_str(&seed).unwrap_or_default();
+pub fn parse_devices(text: &str) -> Vec<DeviceConfig> {
+    let mut devices = Vec::new();
+    let mut current: Option<DeviceConfig> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line == "[" {
+            if let Some(device) = current.take() {
+                devices.push(device);
             }
+            current = Some(DeviceConfig {
+                name: String::new(),
+                cooling_name: None,
+                path: None,
+                def_target: 0,
+                select_higher: true,
+            });
+            continue;
         }
-        cfg
+        if line == "]" {
+            if let Some(device) = current.take() {
+                devices.push(device);
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(device) = current.as_mut() else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "name" => device.name = value.to_owned(),
+            "cooling_name" => device.cooling_name = Some(value.to_owned()),
+            "path" => device.path = Some(PathBuf::from(value)),
+            "def_target" => device.def_target = value.parse().unwrap_or(0),
+            "select_higher" => device.select_higher = value.parse::<i64>().unwrap_or(1) != 0,
+            _ => {}
+        }
     }
 
-    pub fn apply_weights(&self, w: &mut Weights) {
-        if let Some(ref wc) = self.weights {
-            if let Some(v) = wc.cpu { w.cpu = v; }
-            if let Some(v) = wc.batt { w.batt = v; }
-            if let Some(v) = wc.chg { w.chg = v; }
-            if let Some(v) = wc.wifi { w.wifi = v; }
-            if let Some(v) = wc.pa0 { w.pa0 = v; }
-            if let Some(v) = wc.pa1 { w.pa1 = v; }
-            if let Some(v) = wc.quiet { w.quiet = v; }
-            if let Some(v) = wc.conn { w.conn = v; }
-            if let Some(v) = wc.hotspot { w.hotspot = v; }
-        }
+    if let Some(device) = current {
+        devices.push(device);
     }
+
+    devices.retain(|device| !device.name.is_empty());
+    devices
 }
 
-pub fn f5mimic_config_json() -> String {
-    r#"{
-    "weights": {"cpu":200,"batt":200,"chg":100,"wifi":60,"pa0":40,"pa1":80,"quiet":150,"conn":100,"hotspot":60},
-    "cpu0":  {"trig":[66000,72000,78000,84000,90000],"clr":[60000,66000,72000,78000,84000],"targets":[1651200,1401600,1209600,1017600,902400]},
-    "cpu3":  {"trig":[66000,72000,78000,84000,90000,95000,99000],"clr":[60000,66000,72000,78000,84000,89000,93000],"targets":[1900800,1651200,1459200,1248000,1056000,902400,787200]},
-    "cpu7":  {"trig":[66000,72000,78000,84000,90000,95000,99000],"clr":[60000,66000,72000,78000,84000,89000,93000],"targets":[1814400,1564800,1363200,1152000,960000,844800,691200]},
-    "gpu":   {"trig":[68000,75000,82000,89000,95000,100000],"clr":[62000,69000,76000,83000,89000,94000],"freqs":[633000000,500000000,400000000,300000000,220000000,150000000]},
-    "battery":{"limit_temps":[46000,48000,50000,52000,54000,56000],"limit_currents":[1500000,1200000,900000,600000,300000,0],"restrict_level":3,"suspend_level":4,"clamp_temps":[34500,36000,37500,39000],"clamp_currents":[1000000,600000,350000,150000]},
-    "power": {
-        "max_freq_p0":1843200,"max_freq_p3":2572800,"max_freq_p6":0,"max_freq_p7":2918400,
-        "boot_guard_s":90,"boot_max_p0":1478400,"boot_max_p3":2000000,"boot_max_p6":0,"boot_max_p7":2265600,
-        "governor":"walt","swappiness":100,"gate_temp":70000,
-        "boost":0,"dirty_ratio":20,"dirty_bg":5,
-        "props":[
-            {"name":"persist.vendor.disable_idle_fps","value":"false"},
-            {"name":"vendor.dfps.enable","value":"true"},
-            {"name":"debug.vendor.perf.smart_touch","value":"0"},
-            {"name":"vendor.perf.framepacing.enable","value":"0"}
-        ]
-    }
+pub fn load_text(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let plain = is_plain_text(&bytes);
+    let bytes = if plain {
+        bytes
+    } else {
+        crypto::decrypt(&bytes)?
+    };
+
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    let text = String::from_utf8(bytes[..end].to_vec())
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(text)
 }
-"#
-    .to_string()
+
+fn is_plain_text(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    text.chars().all(|character| {
+        character == '\n' || character == '\r' || character == '\t' || !character.is_control()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sections_and_values() {
+        let text = "[A]\nalgo_type\tss\nsensor\tS0\ndevice\tcpu0+cpu1\ntrig\t1 2 3\ntarget\t10+11 20+21 30+31\n";
+        let config = parse_thermal(text);
+        assert_eq!(config.sections.len(), 1);
+        let section = &config.sections[0];
+        assert_eq!(section.name, "A");
+        assert_eq!(section.get("algo_type"), Some("ss"));
+        assert_eq!(section.ints("trig"), vec![1, 2, 3]);
+        assert_eq!(section.plus_words("device"), vec!["cpu0", "cpu1"]);
+    }
+
+    #[test]
+    fn parses_region_map() {
+        let entries = parse_region_map("8.21.0:thermal-map-india.conf\n# x\n8.22.0:other.conf\n");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "8.21.0");
+        assert_eq!(entries[0].1, "thermal-map-india.conf");
+    }
+
+    #[test]
+    fn parses_thermal_map() {
+        let text = "[0:thermal-normal.conf]\n[27:thermal-charge.conf]\n[bad]\n";
+        assert_eq!(
+            parse_thermal_map(text),
+            vec![
+                (0, "thermal-normal.conf".to_owned()),
+                (27, "thermal-charge.conf".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_device_blocks() {
+        let text = "# x\n[\nname:gpu\ncooling_name:gpu\ndef_target:0\nselect_higher:1\n]\n";
+        let devices = parse_devices(text);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "gpu");
+        assert_eq!(devices[0].cooling_name.as_deref(), Some("gpu"));
+        assert!(devices[0].select_higher);
+    }
 }

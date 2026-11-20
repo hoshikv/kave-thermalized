@@ -1,27 +1,14 @@
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub struct SysfsNode {
     file: File,
-    path: String,
-    writable: bool,
-    fail_logged: bool,
 }
 
 impl SysfsNode {
-    pub fn open(path: &str, writable: bool) -> Option<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(writable)
-            .open(path)
-            .ok()?;
-        Some(Self {
-            file,
-            path: path.to_string(),
-            writable,
-            fail_logged: false,
-        })
+    pub fn open(path: &str) -> Option<Self> {
+        File::open(path).ok().map(|file| Self { file })
     }
 
     pub fn read_i32(&mut self) -> Option<i32> {
@@ -29,47 +16,6 @@ impl SysfsNode {
         let mut buf = String::with_capacity(32);
         self.file.read_to_string(&mut buf).ok()?;
         buf.trim().parse().ok()
-    }
-
-    pub fn read_string(&mut self) -> Option<String> {
-        self.file.seek(SeekFrom::Start(0)).ok()?;
-        let mut buf = String::with_capacity(64);
-        self.file.read_to_string(&mut buf).ok()?;
-        Some(buf.trim().to_string())
-    }
-
-    pub fn write_i32(&mut self, value: i32) -> bool {
-        if !self.writable {
-            return false;
-        }
-        self.write_raw(&format!("{}", value))
-    }
-
-    pub fn write_raw(&mut self, content: &str) -> bool {
-        if !self.writable {
-            crate::klog(&format!("WRITE_SKIP(not-writable) {} <- {:?}", self.path, content.trim()));
-            return false;
-        }
-        if let Err(e) = self.file.seek(SeekFrom::Start(0)) {
-            crate::klog(&format!("WRITE_FAIL(seek) {} <- {:?} err={}", self.path, content.trim(), e));
-            return false;
-        }
-        if let Err(e) = self.file.set_len(0) {
-            crate::klog(&format!("WRITE_FAIL(truncate) {} <- {:?} err={}", self.path, content.trim(), e));
-            return false;
-        }
-        match self.file.write_all(content.as_bytes()) {
-            Ok(_) => {
-                crate::klog(&format!("WRITE_OK {} <- {:?}", self.path, content.trim()));
-                self.fail_logged = false;
-                true
-            }
-            Err(e) => {
-                crate::klog(&format!("WRITE_FAIL(io) {} <- {:?} err={}", self.path, content.trim(), e));
-                self.fail_logged = true;
-                false
-            }
-        }
     }
 }
 
