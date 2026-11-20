@@ -21,10 +21,15 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 const TICK_MS: u64 = 1000;
 
+#[cfg(feature = "debug-log")]
+const PROCESS_NAME: &str = "hoshikv-thermal-debug";
+#[cfg(not(feature = "debug-log"))]
+const PROCESS_NAME: &str = "hoshikv-thermal";
+
 pub fn klog(msg: &str) {
-    println!("hoshikv-thermal: {}", msg);
+    println!("{PROCESS_NAME}: {msg}");
     if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open("/dev/kmsg") {
-        let _ = f.write_all(format!("<6>hoshikv-thermal: {}\n", msg).as_bytes());
+        let _ = f.write_all(format!("<6>{PROCESS_NAME}: {msg}\n").as_bytes());
     }
 }
 
@@ -141,7 +146,12 @@ fn main() {
     unsafe {
         libc::signal(SIGTERM, on_signal as *const () as usize);
         libc::signal(SIGINT, on_signal as *const () as usize);
-        libc::prctl(libc::PR_SET_NAME, c"hoshikv-thermal".as_ptr(), 0, 0, 0);
+        let process_name = if cfg!(feature = "debug-log") {
+            c"hoshikv-thermal-debug"
+        } else {
+            c"hoshikv-thermal"
+        };
+        libc::prctl(libc::PR_SET_NAME, process_name.as_ptr(), 0, 0, 0);
     }
 
     klog("hoshikv-thermal mi_thermald bridge starting");

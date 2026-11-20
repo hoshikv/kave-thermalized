@@ -41,7 +41,7 @@ impl Default for Options {
             sysfs_root: env_path("MI_THERMALD_SYSFS_ROOT").unwrap_or_else(|| PathBuf::from("/")),
             dry_run: env_flag("MI_THERMALD_DRY_RUN"),
             once: false,
-            verbose: env_flag("MI_THERMALD_VERBOSE"),
+            verbose: cfg!(feature = "debug-log") || env_flag("MI_THERMALD_VERBOSE"),
             raw_cache: None,
         }
     }

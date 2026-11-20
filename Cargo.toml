@@ -8,6 +8,10 @@ description = "hoshikv-thermal: mi_thermald engine + IThermal AIDL HAL for Redmi
 name = "hoshikv-thermal"
 path = "src/main.rs"
 
+[features]
+default = []
+debug-log = []
+
 [dependencies]
 rsbinder = { version = "0.10", default-features = false }
 libc = "0.2"
@@ -23,3 +27,8 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[profile.release-debug]
+inherits = "release"
+debug = 2
+strip = false

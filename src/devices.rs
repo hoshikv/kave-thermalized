@@ -181,6 +181,11 @@ impl DeviceStore {
         if device.last == Some(effective) && device.last_applied == Some(applied) {
             return Ok(applied);
         }
+        #[cfg(feature = "debug-log")]
+        debug_log(&format!(
+            "{name}: requested={target} effective={effective} applied={applied} previous={:?}",
+            device.last
+        ));
         if !dry_run {
             if let Some(path) = &device.path {
                 let payload = if let Some(write_name) = &device.write_name {
@@ -188,7 +193,13 @@ impl DeviceStore {
                 } else {
                     format!("{applied}")
                 };
-                fs::write(path, payload).map_err(|error| format!("{}: {error}", path.display()))?;
+                if let Err(error) = fs::write(path, payload) {
+                    #[cfg(feature = "debug-log")]
+                    debug_log(&format!("{name}: write {} failed: {error}", path.display()));
+                    return Err(format!("{}: {error}", path.display()));
+                }
+                #[cfg(feature = "debug-log")]
+                debug_log(&format!("{name}: wrote {} value={applied}", path.display()));
             }
         }
         device.last = Some(effective);
@@ -261,6 +272,19 @@ impl DeviceStore {
 
     pub fn read_sysfs_i64(&self, path: &str) -> Option<i64> {
         self.read_cached_i64(&self.root.join(path))
+    }
+}
+
+#[cfg(feature = "debug-log")]
+fn debug_log(text: &str) {
+    use std::io::Write;
+
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/hoshikv-thermal-debug.log")
+    {
+        let _ = writeln!(file, "{text}");
     }
 }
 
