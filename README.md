@@ -1,263 +1,334 @@
 # kave-thermalized
 
-Rust thermal engine and `android.hardware.thermal.IThermal` AIDL HAL for the
-Redmi Turbo 3 (peridot, SM8635).
+`hoshikv-thermal` is the `android.hardware.thermal.IThermal/default` AIDL HAL
+for the Redmi Turbo 3 (peridot, SM8650). It embeds the vendor `mi_thermald`
+policy engine in the HAL process. The old Kave stepped engine, guard, load
+tracker, tuner, and JSON policy file have been removed.
 
-The service registers:
+This is not a kernel thermal driver. The kernel exposes thermal zones and
+cooling devices; `hoshikv-thermal` publishes them through AIDL and the embedded
+engine applies the vendor INI policy.
 
-```
-android.hardware.thermal.IThermal/default
-```
+## Runtime model
 
-It combines a userspace thermal policy engine with a VINTF-stable AIDL HAL. The
-engine reads Qualcomm thermal zones and cooling devices through sysfs, applies
-frequency and feature limits in steps, and publishes temperatures, thresholds,
-cooling-device states, and throttling callbacks to Android.
+- One process owns both the binder service and the policy engine.
+- The binder thread registers `android.hardware.thermal.IThermal/default`.
+- The HAL publishes temperatures, thresholds, cooling-device states, and
+  throttling callbacks every second.
+- HAL sensor reads and cooling-device reads are read-only.
+- All policy writes come from the embedded `mi_thermald` engine.
+- The engine watches `/sys/class/thermal/thermal_message/sconfig`; a change
+  rebuilds the worker set while preserving sensor history and device targets.
+- The engine runs in a thread named `mi-thermald`. There is no separate
+  `mi_thermald` daemon spawned by this binary.
 
-The repository is named `kave-thermalized`; the built binary remains
-`hoshikv-thermal`.
-
-## Features
-
-### AIDL thermal HAL
-
-- Implements `IThermal` as a Rust binder service through `rsbinder`.
-- Registers `android.hardware.thermal.IThermal/default`.
-- Supports temperature and cooling-device queries, with and without type
-  filtering.
-- Publishes static hot-threshold tables for every sensor.
-- Supports registration and unregistration of thermal-change callbacks.
-- Supports optional callback filtering by `TemperatureType`.
-- Rejects duplicate callback registrations.
-- Runs the binder thread pool separately from the control loop.
-- Reports callback events when a sensor's throttling severity changes.
-
-Published sensors:
-
-| Type | Sensors |
-|---|---|
-| CPU | `CPU0` through `CPU7`, sourced from per-core thermal zones |
-| GPU | `GPU0` through `GPU3` |
-| NPU | `nsp0` through `nsp3` |
-| Battery | `battery` from the battery power supply |
-| Skin | `skin` and `shell_skin` from the weighted virtual temperature |
-| BCL | `socd` percentage and `vbat` voltage |
-| Cooling devices | `cpufreq-cpu0`, `cpufreq-cpu3`, `cpufreq-cpu7`, `gpu`, `battery` |
-
-Each temperature is reported with one of the standard throttling severities:
-`NONE`, `LIGHT`, `MODERATE`, `SEVERE`, `CRITICAL`, `EMERGENCY`, or `SHUTDOWN`.
-
-### Thermal sensing
-
-- Probes thermal zones by type instead of hard-coding zone numbers.
-- Reads CPU, GPU, battery, charger, Wi-Fi, PA, quiet, connection, flash, modem,
-  hotspot, and per-cluster junction sensors.
-- Uses fallback values when optional zones are missing and logs unavailable
-  nodes.
-- Builds a weighted virtual temperature from CPU, battery, charger, Wi-Fi, PA0,
-  PA1, quiet, connection, and hotspot readings.
-- Uses the battery power-supply temperature when it reports a usable value.
-- Reads screen state for the load tracker.
-- Converts per-cluster junction readings into CPU temperatures with an 8 C
-  offset and never reports below the main CPU thermal zone.
-
-### Stepped thermal policy
-
-The main engine runs once per second and applies stepped policies for:
-
-- CPU cluster 0, cluster 1, and cluster 2 frequency caps.
-- GPU maximum frequency.
-- CDSP cooling state.
-- LMH cooling state.
-- CPU hotplug/pause states for CPUs 3, 4, and 7.
-- Thermal message state.
-- Torch level.
-- Wi-Fi and hotspot limits.
-- Maximum display brightness.
-- Modem limit.
-- Voice limit.
-- Board temperature reporting.
-
-Each policy has separate trigger, clear, and target arrays. Hysteresis is handled
-by clearing at a lower temperature than the trigger.
-
-CPU and GPU inputs can come from the bundled configuration. Default frequency
-tables are tuned for peridot and can be replaced without rebuilding.
-
-### Adaptive guard and load tracking
-
-- Tracks CPU utilization from `/proc/stat`.
-- Tracks average CPU frequency across the available policies.
-- Tracks GPU busy time from KGSL nodes when available.
-- Combines CPU load, CPU frequency, and GPU load into a smoothed load score.
-- Classifies load as quiescent, background, active, heavy, or saturated.
-- Adds dwell-time filtering to avoid rapid load-class changes.
-- Evaluates CPU, board, and battery risk as nominal, elevated, high, critical, or
-  thermal.
-- Applies emergency frequency caps when CPU, board, or battery temperature
-  reaches critical levels.
-- Rate-limits repeated protection trips.
-- Temporarily disables adaptive control after 12 thermal violations within one
-  hour.
-- Restores adaptive control after the violation count falls below four.
-- Enters failsafe after ten consecutive bad sensor readings and releases all
-  applied limits.
-- Releases CPU, GPU, CDSP, LMH, hotplug, display, modem, and charging limits on
-  shutdown or sensor failure.
-
-### Charging thermal mitigation
-
-- Reads battery temperature and USB online state.
-- Tracks the battery-temperature rate of change with a smoothed estimate.
-- Ramps the constant charge current down between 42 C and 50 C.
-- Stops charge-current requests at 50 C.
-- Uses the current `constant_charge_current` value as the maximum FCC at
-  startup.
-- Leaves charging untouched while USB is offline.
-
-### Power and frequency tuning
-
-- Applies per-policy maximum frequencies for policies 0, 3, 6, and 7.
-- Snaps requested frequencies to values present in the kernel's available
-  frequency table.
-- Restores the kernel minimum frequency after boot-time modifications.
-- Enables temperature-gated frequency caps with a configurable release margin.
-- Supports an optional boot guard with separate boot-time frequency caps.
-- Supports `schedutil`, `conservative`, `walt`, `powersave`, and `performance`
-  governors.
-- Applies WALT up/down rate limits when WALT is selected.
-- Sets `swappiness`, dirty ratios, and disables CPU boost when requested.
-- Applies Android properties on the first tuning pass.
-- Reapplies important values every ten seconds instead of spinning the loop.
-
-### Observability
-
-- Logs to stdout and `/dev/kmsg` with the prefix `hoshikv-thermal:`.
-- Prints a compact status line every two seconds.
-- Writes a rolling status history to `/data/vendor/thermal/custom.dump`.
-- Keeps the last 128 status lines in the dump.
-- Includes sensor temperatures, policy levels, load class, guard state, charging
-  temperature, and configured power limits in the status output.
-- Logs every sysfs write result, including failures.
-- Handles `SIGINT` and `SIGTERM` by releasing all managed controls.
+`mi-thermald` logs to stdout and `/dev/kmsg` with the `hoshikv-thermal:` prefix.
 
 ## Configuration
 
-The engine loads a JSON configuration from:
+The engine reads the vendor INI tree. The initial profile is selected in this
+order:
 
-1. `/data/vendor/thermal/thermal_config.json`
-2. `/vendor/etc/thermal_config.json`
+1. `MI_THERMALD_CONFIG`, when set.
+2. Charger boot mode: `/odm/etc/thermal-chg-only.conf`, or the indexed
+   `/vendor/etc/thermal-chg-only[-N].conf` when a vendor normal profile exists.
+3. The region map (`MI_THERMALD_REGION_MAP`, `/odm/etc/thermal-region-map.conf`,
+   or `/vendor/etc/thermal-region-map.conf`) matched against
+   `MI_THERMALD_HWVERSION` or `ro.boot.hwversion`.
+4. The global mode in `/data/vendor/thermal/thermal-global-mode`, mapped
+   through `thermal-map.conf`.
+5. `thermal-normal.conf` in the selected config directory.
 
-If neither file is usable, it writes a built-in default configuration to
-`/data/vendor/thermal/thermal_config.json` and uses that copy.
+A profile name is resolved in this order:
 
-Only the sections currently consumed by the engine are documented here.
-Legacy or placeholder keys in the bundled file are intentionally omitted.
+1. `/data/vendor/thermal/config/<name>`
+2. the selected config directory
+3. `/odm/etc/<name>`
+4. `/vendor/etc/<name>`
 
-### Active keys
+`thermal-map.conf` is searched at the selected config directory,
+`/odm/etc/thermal-map.conf`, and `/vendor/etc/thermal-map.conf`. On peridot,
+the active policy is `/odm/etc/thermal-normal.conf`; the ODM map file is absent
+and the vendor map is used. `/vendor/etc/thermal-normal.conf` is also absent.
+`/data/vendor/thermal/config/` is optional and was empty on the reference
+device.
 
-| Section | Keys | Purpose |
-|---|---|---|
-| `weights` | `cpu`, `batt`, `chg`, `wifi`, `pa0`, `pa1`, `quiet`, `conn`, `hotspot` | Weights for virtual temperature |
-| `cpu0`, `cpu3`, `cpu7` | `trig`, `clr`, `targets` | CPU cluster step policies |
-| `gpu` | `trig`, `clr`, `freqs` | GPU step policy and frequency table |
-| `power` | `max_freq_p0`, `max_freq_p3`, `max_freq_p6`, `max_freq_p7` | Per-policy frequency caps |
-| `power` | `gate_temp` | Temperature that enables frequency caps |
-| `power` | `governor` | CPU governor selection |
-| `power` | `swappiness`, `dirty_ratio`, `dirty_bg` | VM tuning |
-| `power` | `boot_guard_s`, `boot_max_p0`, `boot_max_p3`, `boot_max_p6`, `boot_max_p7` | Optional boot-time frequency cap |
-| `power` | `props` | Android properties applied at startup |
+Encrypted profiles use AES-128-CBC with the vendor key and IV, no padding, and
+NUL termination. The loader also accepts plaintext INI files. The encrypted
+tree is intentionally not decoded into the repository.
 
-`trig`, `clr`, and `targets` arrays represent temperature steps, release
-thresholds, and output values. Trigger and clear arrays must use the same step
-count. CPU targets are in kHz and GPU targets are in Hz.
+The engine can be redirected for testing:
+
+| Variable | Meaning |
+|---|---|
+| `MI_THERMALD_CONFIG_DIR` | Config directory override |
+| `MI_THERMALD_CONFIG` | Single config file override |
+| `MI_THERMALD_MAP` | `thermal-map.conf` override |
+| `MI_THERMALD_REGION_MAP` | `thermal-region-map.conf` override |
+| `MI_THERMALD_DEVICES` | `thermald-devices.conf` override |
+| `MI_THERMALD_SYSFS_ROOT` | Sysfs root prefix |
+| `MI_THERMALD_HWVERSION` | Region-map hardware version override |
+| `MI_THERMALD_BOOTMODE` | Boot-mode override |
+| `MI_THERMALD_DRY_RUN` | Log intended writes without applying them |
+| `MI_THERMALD_VERBOSE` | Verbose config and worker logging |
+
+Typical policy sections are `[MONITOR-*]`, `[SS-CPU*]`, `[SIC-BAT]`, and
+virtual/simulated sensor sections. `mi_thermald` supports the `monitor`, `ss`,
+`sic`, and `chrono` worker types. A `device` value may contain several device
+names separated by `+`; the device store applies the highest or lowest request
+according to the vendor `select_higher` setting.
+
+A reference dry run on the target loaded 77 sensors, 26 devices, and 20
+algorithms. The active set included `MONITOR-SENSOR0`, `SS-CPU0`, `SS-CPU3`,
+`SS-CPU7`, `MONITOR-BAT`, `SIC-BAT`, `MONITOR-TEMP_STATE`, `MONITOR-GPU`,
+`SS-LMH_CPU7`, and `MONITOR-NPU`.
+
+## HAL interface
+
+The HAL publishes these temperature names:
+
+| Type | Names |
+|---|---|
+| CPU | `CPU0`–`CPU7` |
+| GPU | `GPU0`–`GPU3` |
+| NPU | `nsp0`–`nsp3` |
+| Battery | `battery` |
+| Skin | `skin`, `shell_skin` |
+| BCL | `socd`, `vbat` |
+
+CPU zones are `cpu-0-0-0`, `cpu-0-1-0`, `cpu-0-2-0`, `cpu-1-0-0`,
+`cpu-1-1-0`, `cpu-1-2-0`, `cpu-1-3-0`, and `cpu-2-0-0`; GPU zones are
+`gpuss-0` through `gpuss-3`; NPU zones are `nsphvx-0`, `nsphvx-1`, `nsphmx-0`,
+and `nsphmx-1`.
+Missing zones fall back to 25 °C; the battery value prefers
+`/sys/class/power_supply/battery/temp`.
+
+Hot thresholds in °C:
+
+| Group | Thresholds |
+|---|---|
+| CPU | 70, 80, 90, 98, 105, 115 |
+| GPU | 60, 70, 80, 90, 100, 110 |
+| NPU | 65, 75, 85, 95, 105, 115 |
+| Battery | 43, 45, 48, 50, 52, 55 |
+| Skin | 46, 50, 54, 58, 62, 66 |
+
+`skin` and `shell_skin` are weighted virtual sensors. The default weights are
+CPU 200, battery 200, charger 100, Wi-Fi 60, PA0 40, PA1 80, quiet 150,
+connection 100, and hotspot 60. The virtual value uses the available zones and
+falls back to `quiet_therm`.
+
+Cooling devices exposed by the HAL are `cpufreq-cpu0`, `cpufreq-cpu3`,
+`cpufreq-cpu7`, `gpu`, and `battery`.
+
+Callbacks are registered with `registerThermalChangedCallback`; type filtering
+uses the AIDL `TemperatureType`. The HAL does not write cooling state.
+
+## oplus thermal stack
+
+These components are present on peridot and are relevant when diagnosing
+thermal behavior. They are separate from the embedded `mi_thermald` policy.
+
+| Component | Role |
+|---|---|
+| `ostatsd` | OStats telemetry; not a thermal controller |
+| HANS | Scene and freezer management; not an INI policy engine |
+| horae | Thermal status and process-binding service |
+| `OplusThermalService` | Framework consumer of `sys_thermal_config.xml` |
+| oplus Battery | Parser for `sys_thermal_control_config*.xml` app/gear data |
+
+### `ostatsd`
+
+Service name is `ostatsd`, with interface `com.oplus.ostats.api.IOStats`; the
+binary is `/system_ext/bin/ostatsd`. Related processes are `ostats_pullerd` and
+`ostats_tpd`. Its init script creates `/data/misc/ostats`, `packet_files`,
+`dcs_config`, `database`, and `database/thermal_analysis`. It collects thermal
+statistics, app memory metrics, DCS data, and `MidasConfig`/`OStatsConfig`; it
+does not select a thermal profile or write cooling devices.
+
+### HANS
+
+Service `/system_ext/bin/hans` is disabled initially and starts when
+`sys.hans.enable=true`. It sets up `/dev/freezer` and exposes
+`oplus.hans.IHansComunication`. Useful properties are
+`persist.vendor.enable.hans` and `persist.sys.hans.appcard.enable`.
+
+`HansSceneManager` provides `getSceneIdByScene()` and
+`notifyAppGoForeground(int, String)`. Its app-target constants include
+`APP_TARGET_INVALID=0`, `APP_TARGET_THIRD=1`, `APP_TARGET_WHITELIST=2`,
+`APP_TARGET_EX_WHITELIST=4`, `APP_TARGET_MAX=8`, and
+`AIRPLANE_SCENE_TARGET=7`. Scene IDs include `SCENE_ID_AIRPLANE`,
+`SCENE_ID_CAMERA_MIN_SYSTEM`, `SCENE_ID_CPU_HIGH_LOAD`, `SCENE_ID_DEEP_IDLE`,
+`SCENE_ID_DEEP_SLEEP`, `SCENE_ID_GAME_MIN_SYSTEM`, `SCENE_ID_IDLE`,
+`SCENE_ID_LIVE_STREAM_MIN_SYSTEM`, `SCENE_ID_NIGHT_DEEP_DOZE`, and
+`SCENE_ID_STRICT_MODE`.
+
+HANS scene notifications do not currently change a `mi_thermald` profile.
+
+### horae
+
+Service `horae` exposes `com.oplus.horae.IHoraeService` and registers
+`com.oplus.thermalcontrol.IThermalStatusListener`. Observed transactions cover
+register (1), unregister (2), status (4), current temperatures (17), specified
+temperatures (20), all shell temperatures (21), ambient temperature (25), and
+process binding information (101). It reports thermal state and bindings; this
+repository does not parse a horae policy file.
+
+### `sys_thermal_config.xml`
+
+This file is a monitoring list, not a package-to-`sconfig` map. The reference
+copy sets `more_heat=490`, `heat=440`, `less_heat=410`, `preheat=400`,
+`thermal_heat_path=/sys/class/thermal/thermal_zone84/temp`,
+`thermal_battery_temp=1`, and `thermal_monitor_app_limit_time=1200000`.
+`thermal_monitor_application` includes entries such as
+`com.tencent.tmgp.pubgmhd`, `com.tencent.tmgp.sgame`,
+`com.ss.android.ugc.aweme`, `com.smile.gifmaker`, and
+`com.tencent.tmgp.pubgm`.
+
+`OplusThermalService` looks it up through
+`OplusCfgFilePolicy.getCfgTopPriorityFile("sys_thermal_config.xml",
+"etc/ThermalServiceConfig", 3)` and reads the `sys_thermal_config` provider.
+No `ThermalServiceConfig` directory was found on the reference device, so the
+exact active file path is not confirmed.
+
+### `sys_thermal_control_config*.xml`
+
+These are oplus Battery app/gear configurations. `ThermalConfigUtil`
+(`lb.h`) parses them in `loadApListFromXml`. The XML contains:
+
+- `<specific>` groups whose tag names are hyphen-joined package names, such as
+  `com.android.settings-com.android.mms-com.android.contacts`.
+- `<specificScene>` groups whose tag names add `_scene_N` suffixes, for example
+  `com.tencent.mm_scene_103-com.tencent.mobileqq_scene_103-...`.
+- `<scene>` entries such as `scene_16`, `scene_101` through `scene_105`,
+  `scene_150`, and `scene_151`.
+
+Each group contains `tempGear` entries with `<gear_config>` attributes for CPU,
+GPU, brightness, charging, FPS, refresh rate, restrictions, camera, flashlight,
+Wi-Fi hotspot, video, and boost behavior. The parser here is oplus Battery, not
+`mi_thermald`.
+
+The device carries variants under
+`/my_product/cust/{EUEX,ROW,US}/etc/temperature_profile/`. The IN directory was
+empty in the reference check. `ThermalConfigUtil` resolves the profile through
+`/etc/temperature_profile` and `OplusCfgFilePolicy`; the active regional choice
+is not verified by this project.
+
+## Applist and `sconfig`
+
+`mi_thermald` currently has no applist reader. It selects profiles from
+`sconfig`, which is owned by `system_server` and exposed at
+`/sys/class/thermal/thermal_message/sconfig`. The engine polls that file every
+500 ms and resolves the numeric value through `thermal-map.conf`.
+
+The oplus app/gear XML files described above do not feed the embedded engine.
+Editing them will not change the current `mi_thermald` profile. A future applist
+implementation would need a separate file and a package-to-`sconfig` contract;
+the schema below is only a proposal:
+
+```yaml
+applist:
+  enabled: true
+  default: -1
+  poll_ms: 1000
+  apps:
+    com.tencent.tmgp.sgame: 18
+    com.tencent.tmgp.pubgmhd: 18
+```
+
+No applist file exists in this repository or in the reference `mi_thermald`
+tree. Do not treat the proposed schema as implemented behavior.
 
 ## Project structure
 
 ```
 .
-├── aidl/android/hardware/thermal/
-│   ├── CoolingDevice.aidl
-│   ├── CoolingType.aidl
-│   ├── IThermal.aidl
-│   ├── IThermalChangedCallback.aidl
-│   ├── Temperature.aidl
-│   ├── TemperatureThreshold.aidl
-│   ├── TemperatureType.aidl
-│   └── ThrottlingSeverity.aidl
+├── aidl/android/hardware/thermal/  # generated AIDL definitions
 ├── src/
-│   ├── main.rs        # entrypoint, control loop, engine, charging, dump
-│   ├── hal.rs         # IThermal implementation and callback registry
-│   ├── sensors.rs     # thermal-zone probing and virtual temperature
-│   ├── policy.rs      # stepped trigger/clear policy
-│   ├── guard.rs       # emergency caps, rate limiting, failsafe inputs
-│   ├── loadstat.rs    # CPU/GPU load tracking and classification
-│   ├── tuner.rs       # frequency, governor, VM, and property tuning
-│   ├── config.rs      # JSON loading, schema, and built-in seed
-│   └── sysfs.rs       # sysfs node and cooling-device helpers
-├── prebuilt/
-│   ├── hoshikv-thermal-v2.0
-│   ├── hoshikv-thermal-v2.1
-│   ├── hoshikv-thermal-v2.2
-│   ├── hoshikv-thermal-v2.3
-│   └── hoshikv-thermal-v2.4
+│   ├── main.rs                    # binder, HAL tick, engine lifecycle
+│   ├── hal.rs                     # IThermal service and callbacks
+│   ├── sensors.rs                 # HAL sensor probing and virtual skin
+│   ├── sysfs.rs                   # read-only sysfs/cooling helpers
+│   ├── mi_thermald.rs             # config selection and policy lifecycle
+│   ├── algos.rs                   # monitor/ss/sic/chrono workers
+│   ├── config.rs                  # INI, device, map, region parsers
+│   ├── crypto.rs                  # AES-128-CBC decryption
+│   ├── devices.rs                 # cooling-device arbitration
+│   └── thermal_sensors.rs         # engine sensor store
+├── prebuilt/                      # earlier release binaries
 ├── build.rs
 ├── Cargo.toml
-├── Cargo.lock
-├── thermal_config.json
-├── .cargo/config.toml
-└── README.md
+└── Cargo.lock
 ```
+
+`thermal_sensors.rs` is the engine's sensor store. `sensors.rs` is the HAL's
+read-only sensor feed.
 
 ## Build
 
-Requirements:
+The checked-in `.cargo/config.toml` defaults to Android, so host tests need an
+explicit target:
 
-- Rust toolchain with Cargo.
-- Android NDK.
-- `aarch64-linux-android` target support through the NDK linker.
+```bash
+cargo fmt --check
+cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+cargo test --target x86_64-unknown-linux-gnu
+cargo build --release --target aarch64-linux-android
+```
 
-The checked-in `.cargo/config.toml` points to:
+The Android linker path is:
 
 ```
 /opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang
 ```
 
-Adjust that path if the NDK is installed elsewhere, then build:
+Adjust `.cargo/config.toml` if the NDK lives elsewhere. `build.rs` generates
+`thermal_aidl.rs` with `rsbinder-aidl`.
 
-```bash
-cargo build --release
-```
-
-The default build target is `aarch64-linux-android`. The binary is written to:
+The release binary is:
 
 ```
 target/aarch64-linux-android/release/hoshikv-thermal
 ```
 
-The AIDL bindings are generated by `build.rs` using `rsbinder-aidl`. The
-interface files are compiled with AIDL version 2 and synchronous methods.
+`prebuilt/` contains binaries from earlier releases. The source build is
+authoritative.
 
-## Deployment notes
+## Deployment
 
-- The binary is a 64-bit Android executable.
-- It needs access to Qualcomm thermal zones, cooling devices, battery power
-  supply nodes, KGSL devfreq nodes, and `/dev/kmsg`.
-- Those accesses normally require vendor/root privileges and matching SELinux
-  policy.
-- The engine writes `/data/vendor/thermal/custom.dump` at runtime.
-- Configuration can be shipped in `/vendor/etc/thermal_config.json` or placed
-  at `/data/vendor/thermal/thermal_config.json`, which takes precedence.
-- No init service definition or vendor makefile is included. Add the binary to
-  the vendor image using the integration expected by the target ROM.
-- The HAL does not replace the kernel thermal driver; it is a userspace policy
-  layer over the existing thermal interfaces.
+The binary must run with root or vendor privileges so it can register the AIDL
+service and write thermal sysfs. The vendor or ODM thermal configuration tree
+must be present.
 
-## Compatibility
+The reference peridot deployment uses `/vendor/bin/hoshikv-thermal` and an init
+service that starts it as the thermal HAL. The test module modifies
+`/vendor/etc/init/hw/init.mi_thermald.rc` to start
+`/system/vendor/bin/hoshikv-thermal`; the stock `/vendor/bin/mi_thermald` stays
+untouched. The repository does not ship that init script or the module.
 
-The sysfs paths and frequency tables are tuned for peridot/SM8635. Other
-Qualcomm devices can reuse the engine, but the sensor names, cooling-device
-names, and frequency tables must match the target kernel.
+If the HAL starts but the engine cannot find a config, the HAL still exposes
+sensor data, but no vendor policy is applied. Check the `hoshikv-thermal:`
+kernel log line and the selected config path before changing thermal XML files.
+
+Useful checks on device:
+
+```bash
+adb shell dmesg | grep hoshikv-thermal
+adb shell service list | grep thermal
+adb shell dumpsys thermalservice
+```
+
+Do not overwrite a stock vendor binary or deploy to `/vendor` without a
+recovery path.
+
+## Known limits
+
+- HANS transaction semantics and scene-to-thermal effects were not probed.
+- The exact active `sys_thermal_config.xml` path is not confirmed; the local
+  copy came from the device firmware.
+- Regional selection of `sys_thermal_control_config.xml` is not verified.
+- The applist/schema above is a proposal, not an implementation.
+- No camera-specific per-app trigger is implemented.
 
 ## AIDL licensing
 
