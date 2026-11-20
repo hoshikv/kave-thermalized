@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::algos::{self, Algo};
 use crate::config::{load_text, parse_devices, parse_region_map, parse_thermal, parse_thermal_map};
 use crate::devices::{is_cpu_name, DeviceStore};
+use crate::sysfs::RawCache;
 use crate::thermal_sensors::SensorStore;
 
 #[derive(Clone, Debug)]
@@ -23,6 +24,7 @@ pub struct Options {
     pub dry_run: bool,
     pub once: bool,
     pub verbose: bool,
+    pub raw_cache: Option<Arc<RawCache>>,
 }
 
 pub type Args = Options;
@@ -40,6 +42,7 @@ impl Default for Options {
             dry_run: env_flag("MI_THERMALD_DRY_RUN"),
             once: false,
             verbose: env_flag("MI_THERMALD_VERBOSE"),
+            raw_cache: None,
         }
     }
 }
@@ -288,7 +291,8 @@ fn build_runtime(args: &Args, config_path: &Path) -> Result<Runtime, String> {
         Err(_) => Vec::new(),
     };
 
-    let sensors = SensorStore::new(&args.sysfs_root, &thermal)?;
+    let raw_cache = args.raw_cache.clone().unwrap_or_default();
+    let sensors = SensorStore::with_cache(&args.sysfs_root, &thermal, raw_cache)?;
     let mut devices = DeviceStore::new(&args.sysfs_root, &device_configs);
     let mut algos = Algo::from_config(&thermal);
 

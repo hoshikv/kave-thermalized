@@ -15,7 +15,7 @@ use std::io::Write as IoWrite;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use sysfs::{find_cdev_by_type, find_zone_by_type, SysfsNode};
+use sysfs::{find_cdev_by_type, find_zone_by_type, RawCache, SysfsNode};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -73,44 +73,68 @@ fn binder_thread(shared: Arc<hal::SharedState>) {
     rsbinder::ProcessState::join_thread_pool().ok();
 }
 
-fn read_cdev(name: &str) -> i64 {
-    find_cdev_by_type(name)
-        .and_then(|path| SysfsNode::open(&path))
-        .and_then(|mut node| node.read_i32())
-        .map(i64::from)
-        .unwrap_or(0)
+struct PublishCache {
+    raw_cache: Arc<RawCache>,
+    zones: HashMap<String, Option<SysfsNode>>,
+    cooling: [(&'static str, Option<SysfsNode>); 5],
 }
 
-fn publish(shared: &Arc<hal::SharedState>, sensors_set: &mut SensorSet) {
-    let reading = sensors_set.read_all(&sensors::Weights::default());
-    let mut zone_paths: HashMap<String, String> = HashMap::new();
-    let mut zone_reader = |zone: &str| -> Option<f32> {
-        let path = match zone_paths.get(zone) {
-            Some(path) => path.clone(),
-            None => {
-                let path = find_zone_by_type(zone)?;
-                zone_paths.insert(zone.to_string(), path.clone());
-                path
-            }
-        };
-        std::fs::read_to_string(path)
-            .ok()?
-            .trim()
-            .parse::<f32>()
-            .ok()
-    };
+impl PublishCache {
+    fn new(raw_cache: Arc<RawCache>) -> Self {
+        Self {
+            raw_cache,
+            zones: HashMap::new(),
+            cooling: [
+                ("cpufreq-cpu0", "cpu-cluster0"),
+                ("cpufreq-cpu3", "cpu-cluster1"),
+                ("cpufreq-cpu7", "cpu-cluster2"),
+                ("gpu", "gpu"),
+                ("battery", "battery"),
+            ]
+            .map(|(name, kind)| {
+                (
+                    name,
+                    find_cdev_by_type(kind).and_then(|path| SysfsNode::open(&path)),
+                )
+            }),
+        }
+    }
 
-    hal::update_from_reading(shared, &reading, &mut zone_reader);
-    hal::refresh_cooling_devices(
-        shared,
-        &[
-            ("cpufreq-cpu0", read_cdev("cpu-cluster0")),
-            ("cpufreq-cpu3", read_cdev("cpu-cluster1")),
-            ("cpufreq-cpu7", read_cdev("cpu-cluster2")),
-            ("gpu", read_cdev("gpu")),
-            ("battery", read_cdev("battery")),
-        ],
-    );
+    fn read_zone(&mut self, zone: &str) -> Option<f32> {
+        if let Some(node) = self.zones.get_mut(zone) {
+            return node
+                .as_mut()?
+                .read_i32_cached(Some(&self.raw_cache))
+                .map(|value| value as f32);
+        }
+        let mut node = find_zone_by_type(zone).and_then(|path| SysfsNode::open(&path));
+        let value = node
+            .as_mut()
+            .and_then(|node| node.read_i32_cached(Some(&self.raw_cache)))
+            .map(|value| value as f32);
+        self.zones.insert(zone.to_owned(), node);
+        value
+    }
+
+    fn cooling_states(&mut self) -> [(&'static str, i64); 5] {
+        let mut states = [("", 0); 5];
+        for (state, (name, node)) in states.iter_mut().zip(self.cooling.iter_mut()) {
+            let value = node
+                .as_mut()
+                .and_then(|node| node.read_i32())
+                .map(i64::from)
+                .unwrap_or(0);
+            *state = (*name, value);
+        }
+        states
+    }
+}
+
+fn publish(shared: &Arc<hal::SharedState>, sensors_set: &mut SensorSet, cache: &mut PublishCache) {
+    let reading = sensors_set.read_all(&sensors::Weights::default());
+    hal::update_from_reading(shared, &reading, &mut |zone| cache.read_zone(zone));
+    let states = cache.cooling_states();
+    hal::refresh_cooling_devices(shared, &states);
 }
 
 fn main() {
@@ -131,10 +155,16 @@ fn main() {
             .ok();
     }
 
-    let mut sensors_set = SensorSet::probe();
+    let raw_cache = Arc::new(RawCache::default());
+    let mut sensors_set = SensorSet::probe(Arc::clone(&raw_cache));
     sensors_set.log_missing();
+    let mut publish_cache = PublishCache::new(Arc::clone(&raw_cache));
 
-    let mut mi_engine = match mi_thermald::Engine::start(mi_thermald::Options::default()) {
+    let options = mi_thermald::Options {
+        raw_cache: Some(raw_cache),
+        ..mi_thermald::Options::default()
+    };
+    let mut mi_engine = match mi_thermald::Engine::start(options) {
         Ok(engine) => {
             klog("mi_thermald engine started");
             Some(engine)
@@ -146,7 +176,7 @@ fn main() {
     };
 
     while !SHUTDOWN.load(Ordering::SeqCst) {
-        publish(&shared, &mut sensors_set);
+        publish(&shared, &mut sensors_set, &mut publish_cache);
         std::thread::sleep(Duration::from_millis(TICK_MS));
     }
 

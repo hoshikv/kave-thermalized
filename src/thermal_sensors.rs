@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::ThermalConfig;
+use crate::sysfs::RawCache;
 
 #[derive(Clone, Debug)]
 pub enum SensorDef {
@@ -28,16 +29,37 @@ struct SensorHistory {
     last2: i64,
 }
 
+const VIRTUAL_CACHE_TTL: Duration = Duration::from_millis(4000);
+
+#[derive(Clone, Copy, Debug)]
+struct VirtualCache {
+    value: i64,
+    at: Instant,
+}
+
 #[derive(Clone, Debug)]
 pub struct SensorStore {
     root: PathBuf,
     defs: HashMap<String, SensorDef>,
+    files: HashMap<String, Arc<Mutex<Option<File>>>>,
+    board_comp: Arc<Mutex<Option<File>>>,
     history: Arc<Mutex<HashMap<String, SensorHistory>>>,
     virtual_lock: Arc<Mutex<()>>,
+    virtual_cache: Arc<Mutex<HashMap<String, VirtualCache>>>,
+    raw_cache: Arc<RawCache>,
 }
 
 impl SensorStore {
+    #[cfg(test)]
     pub fn new(root: &Path, config: &ThermalConfig) -> Result<Self, String> {
+        Self::with_cache(root, config, Arc::new(RawCache::default()))
+    }
+
+    pub fn with_cache(
+        root: &Path,
+        config: &ThermalConfig,
+        raw_cache: Arc<RawCache>,
+    ) -> Result<Self, String> {
         let mut defs = scan_thermal_zones(root)?;
 
         for section in &config.sections {
@@ -77,11 +99,25 @@ impl SensorStore {
             }
         }
 
+        let files = defs
+            .iter()
+            .filter_map(|(name, def)| match def {
+                SensorDef::Generic { .. } | SensorDef::Simulated { .. } => {
+                    Some((name.clone(), Arc::new(Mutex::new(None))))
+                }
+                SensorDef::Virtual { .. } => None,
+            })
+            .collect();
+
         Ok(Self {
             root: root.to_path_buf(),
             defs,
+            files,
+            board_comp: Arc::new(Mutex::new(None)),
             history: Arc::new(Mutex::new(HashMap::new())),
             virtual_lock: Arc::new(Mutex::new(())),
+            virtual_cache: Arc::new(Mutex::new(HashMap::new())),
+            raw_cache,
         })
     }
 
@@ -132,16 +168,24 @@ impl SensorStore {
             return Err(format!("unknown sensor {name}"));
         };
         match def {
-            SensorDef::Generic { path } | SensorDef::Simulated { path } => read_i64(path),
+            SensorDef::Generic { path } | SensorDef::Simulated { path } => {
+                self.read_file(name, path)
+            }
             SensorDef::Virtual {
                 members,
                 weight_sum,
                 compensation,
             } => {
+                if let Some(value) = self.cached_virtual(name) {
+                    return Ok(value);
+                }
                 let _guard = self
                     .virtual_lock
                     .lock()
                     .map_err(|_| format!("virtual sensor lock for {name} poisoned"))?;
+                if let Some(value) = self.cached_virtual(name) {
+                    return Ok(value);
+                }
                 let last = self
                     .history
                     .lock()
@@ -159,22 +203,73 @@ impl SensorStore {
                         sum += value.saturating_mul(*weight);
                     }
                     let divisor = if *weight_sum == 0 { 1 } else { *weight_sum };
-                    let board_comp = read_i64(
-                        &self
-                            .root
-                            .join("sys/class/thermal/thermal_message/board_sensor_temp_comp"),
-                    )
-                    .unwrap_or(0);
+                    let board_comp = self.read_board_comp();
                     let value = sum / divisor + compensation + board_comp;
                     let glitch = last != 0 && (value - last).abs() > 10000;
                     if retries >= 3 || !glitch {
+                        if let Ok(mut cache) = self.virtual_cache.lock() {
+                            cache.insert(
+                                name.to_owned(),
+                                VirtualCache {
+                                    value,
+                                    at: Instant::now(),
+                                },
+                            );
+                        }
                         return Ok(value);
                     }
                     retries += 1;
                     std::thread::sleep(Duration::from_secs(1));
+                    self.raw_cache.clear();
                 }
             }
         }
+    }
+
+    fn cached_virtual(&self, name: &str) -> Option<i64> {
+        let cache = self.virtual_cache.lock().ok()?;
+        let entry = cache.get(name)?;
+        (entry.at.elapsed() < VIRTUAL_CACHE_TTL).then_some(entry.value)
+    }
+
+    fn read_file(&self, name: &str, path: &Path) -> Result<i64, String> {
+        if let Some(value) = self.raw_cache.get(path) {
+            return Ok(value);
+        }
+        let value = self.read_file_uncached(name, path)?;
+        self.raw_cache.put(path, value);
+        Ok(value)
+    }
+
+    fn read_file_uncached(&self, name: &str, path: &Path) -> Result<i64, String> {
+        let Some(cell) = self.files.get(name) else {
+            return read_i64(path);
+        };
+        let mut file = cell
+            .lock()
+            .map_err(|_| format!("sensor {name} file lock poisoned"))?;
+        if file.is_none() {
+            *file = File::open(path).ok();
+        }
+        let file = file
+            .as_mut()
+            .ok_or_else(|| format!("{}: open failed", path.display()))?;
+        crate::sysfs::read_i64_file(file).ok_or_else(|| format!("{}: read failed", path.display()))
+    }
+
+    fn read_board_comp(&self) -> i64 {
+        let path = self
+            .root
+            .join("sys/class/thermal/thermal_message/board_sensor_temp_comp");
+        let Ok(mut file) = self.board_comp.lock() else {
+            return 0;
+        };
+        if file.is_none() {
+            *file = File::open(path).ok();
+        }
+        file.as_mut()
+            .and_then(crate::sysfs::read_i64_file)
+            .unwrap_or(0)
     }
 }
 
@@ -220,10 +315,8 @@ fn scan_thermal_zones(root: &Path) -> Result<HashMap<String, SensorDef>, String>
 }
 
 fn read_i64(path: &Path) -> Result<i64, String> {
-    let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    text.trim()
-        .parse::<i64>()
-        .map_err(|error| format!("{}: {error}", path.display()))
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    crate::sysfs::read_i64_file(&mut file).ok_or_else(|| format!("{}: read failed", path.display()))
 }
 
 #[cfg(test)]

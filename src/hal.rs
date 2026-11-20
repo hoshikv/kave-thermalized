@@ -40,7 +40,7 @@ impl SharedState {
         Arc::new(Self {
             temperatures: RwLock::new(Vec::new()),
             thresholds: build_thresholds(),
-            cooling_devices: RwLock::new(Vec::new()),
+            cooling_devices: RwLock::new(build_cooling_devices()),
             callbacks: CallbackRegistry {
                 entries: Mutex::new(Vec::new()),
             },
@@ -243,13 +243,16 @@ fn compute_severity(value_mc: i32, hot: &[i32; 6]) -> i32 {
     s
 }
 
-fn make_temperature(spec: &SensorSpec, raw_mc: i32, value_f32: f32) -> Temperature {
-    Temperature {
-        r#type: spec.ty,
-        name: spec.name.to_string(),
-        value: value_f32,
-        throttlingStatus: sev_enum(compute_severity(raw_mc, &spec.hot)),
-    }
+fn build_temperatures() -> Vec<Temperature> {
+    SPECS
+        .iter()
+        .map(|spec| Temperature {
+            r#type: spec.ty,
+            name: spec.name.to_string(),
+            value: 0.0,
+            throttlingStatus: ThrottlingSeverity::NONE,
+        })
+        .collect()
 }
 
 pub fn update_from_reading(
@@ -259,11 +262,14 @@ pub fn update_from_reading(
 ) -> Vec<String> {
     let events = Vec::new();
     let mut temps = shared.temperatures.write().unwrap();
+    let mut changed = temps.len() != SPECS.len();
 
-    let mut new_list: Vec<Temperature> = Vec::with_capacity(SPECS.len());
-    let mut severities: Vec<(&'static str, i32)> = Vec::new();
+    if changed {
+        temps.clear();
+        temps.extend(build_temperatures());
+    }
 
-    for spec in SPECS.iter() {
+    for (spec, temperature) in SPECS.iter().zip(temps.iter_mut()) {
         let (raw_mc, value_f32): (i32, f32) = match spec.kind {
             SensorKind::Zone(z) => {
                 let v = zone_reader(z).unwrap_or(25000.0);
@@ -282,17 +288,15 @@ pub fn update_from_reading(
                 (mv, mv as f32 / 1000.0)
             }
         };
-        let t = make_temperature(spec, raw_mc, value_f32);
-        severities.push((spec.name, sev_to_int(&t.throttlingStatus)));
-        new_list.push(t);
+        let severity = sev_enum(compute_severity(raw_mc, &spec.hot));
+        let old_severity = sev_to_int(&temperature.throttlingStatus);
+        let new_severity = sev_to_int(&severity);
+        temperature.value = value_f32;
+        temperature.throttlingStatus = severity;
+        if old_severity != new_severity {
+            changed = true;
+        }
     }
-
-    let changed = temps.is_empty()
-        || temps
-            .iter()
-            .zip(new_list.iter())
-            .any(|(a, b)| sev_to_int(&a.throttlingStatus) != sev_to_int(&b.throttlingStatus));
-    *temps = new_list;
     drop(temps);
 
     if !changed {
@@ -313,18 +317,13 @@ pub fn update_from_reading(
         .collect();
     let mut entries = shared.callbacks.entries.lock().unwrap();
     entries.retain_mut(|entry| {
-        for (name, _) in &severities {
+        for spec in SPECS.iter() {
             if let Some(f) = entry.filter {
-                let want_ty = SPECS
-                    .iter()
-                    .find(|s| s.name == *name)
-                    .map(|s| s.ty)
-                    .unwrap_or(TemperatureType::UNKNOWN);
-                if ttype_to_int(&want_ty) != f {
+                if ttype_to_int(&spec.ty) != f {
                     continue;
                 }
             }
-            if let Some(t) = snapshot.iter().find(|t| t.name == *name) {
+            if let Some(t) = snapshot.iter().find(|t| t.name == spec.name) {
                 if entry.cb.notifyThrottling(t).is_err() {
                     return false;
                 }
@@ -348,8 +347,8 @@ fn build_thresholds() -> Vec<TemperatureThreshold> {
         .collect()
 }
 
-pub fn refresh_cooling_devices(shared: &Arc<SharedState>, states: &[(&str, i64)]) {
-    let mut list = vec![
+fn build_cooling_devices() -> Vec<CoolingDevice> {
+    vec![
         CoolingDevice {
             name: "cpufreq-cpu0".to_string(),
             r#type: CoolingType::CPU,
@@ -375,13 +374,16 @@ pub fn refresh_cooling_devices(shared: &Arc<SharedState>, states: &[(&str, i64)]
             r#type: CoolingType::BATTERY,
             value: 0,
         },
-    ];
+    ]
+}
+
+pub fn refresh_cooling_devices(shared: &Arc<SharedState>, states: &[(&str, i64)]) {
+    let mut list = shared.cooling_devices.write().unwrap();
     for (name, val) in states {
         if let Some(c) = list.iter_mut().find(|c| c.name == *name) {
             c.value = *val;
         }
     }
-    *shared.cooling_devices.write().unwrap() = list;
 }
 
 pub struct ThermalServiceImpl {

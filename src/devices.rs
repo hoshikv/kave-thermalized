@@ -1,28 +1,32 @@
 use std::collections::HashMap;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::config::DeviceConfig;
 use crate::thermal_sensors::resolve;
 
+type CachedFile = Arc<Mutex<Option<File>>>;
+type SysfsCache = HashMap<PathBuf, CachedFile>;
+
 #[derive(Debug)]
 pub struct Device {
     pub path: Option<PathBuf>,
-    pub levels: Vec<i64>,
+    pub levels: Arc<[i64]>,
     pub def_target: i64,
     pub select_higher: bool,
     pub limit: Option<i64>,
     pub last: Option<i64>,
+    last_applied: Option<i64>,
     write_name: Option<String>,
-    requests: HashMap<String, i64>,
+    requests: HashMap<u32, i64>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct DeviceStore {
     root: PathBuf,
     devices: HashMap<String, Arc<Mutex<Device>>>,
+    sysfs: Arc<Mutex<SysfsCache>>,
 }
 
 impl DeviceStore {
@@ -39,11 +43,12 @@ impl DeviceStore {
             };
             let device = Device {
                 path,
-                levels,
+                levels: Arc::from(levels),
                 def_target: config.def_target,
                 select_higher: config.select_higher,
                 limit: None,
                 last: None,
+                last_applied: None,
                 write_name,
                 requests: HashMap::new(),
             };
@@ -53,6 +58,7 @@ impl DeviceStore {
         Self {
             root: root.to_path_buf(),
             devices,
+            sysfs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -70,13 +76,13 @@ impl DeviceStore {
         };
         let (path, write_name) = resolve_device(root, &config, &cooling);
         let cpu = is_cpu_name(name);
-        let levels = if cpu {
+        let levels: Arc<[i64]> = Arc::from(if cpu {
             read_cpu_levels(root, name)
         } else {
             Vec::new()
-        };
+        });
         let def_target = if cpu {
-            let current = read_i64_file(
+            let current = read_i64_path(
                 &root
                     .join("sys/devices/system/cpu")
                     .join(name)
@@ -96,6 +102,7 @@ impl DeviceStore {
             select_higher: !cpu,
             limit: None,
             last: None,
+            last_applied: None,
             write_name,
             requests: HashMap::new(),
         };
@@ -113,6 +120,7 @@ impl DeviceStore {
             };
             if let Ok(mut new_device) = new_device.lock() {
                 new_device.last = old_device.last;
+                new_device.last_applied = old_device.last_applied;
             }
         }
     }
@@ -128,21 +136,20 @@ impl DeviceStore {
             .unwrap_or(0)
     }
 
-    pub fn levels(&self, name: &str) -> Vec<i64> {
+    pub fn levels(&self, name: &str) -> Option<Arc<[i64]>> {
         self.devices
             .get(name)
-            .and_then(|device| device.lock().ok().map(|device| device.levels.clone()))
-            .unwrap_or_default()
+            .and_then(|device| device.lock().ok().map(|device| Arc::clone(&device.levels)))
     }
 
     #[cfg(test)]
     pub fn set_target(&self, name: &str, target: i64, dry_run: bool) -> Result<i64, String> {
-        self.set_target_for("__default__", name, target, dry_run)
+        self.set_target_for(0, name, target, dry_run)
     }
 
     pub fn set_target_for(
         &self,
-        requester: &str,
+        requester: u32,
         name: &str,
         target: i64,
         dry_run: bool,
@@ -153,7 +160,7 @@ impl DeviceStore {
         let mut device = device
             .lock()
             .map_err(|_| format!("device {name} poisoned"))?;
-        device.requests.insert(requester.to_owned(), target);
+        device.requests.insert(requester, target);
         let mut chosen = device.def_target;
         for request in device.requests.values() {
             if device.select_higher {
@@ -171,37 +178,21 @@ impl DeviceStore {
         }
         let effective = chosen;
         let applied = self.apply_battery_scale(name, effective);
-        let selected_nonzero = device.requests.values().any(|request| {
-            *request != 0
-                && if device.select_higher {
-                    *request > device.def_target
-                } else {
-                    *request < device.def_target
-                }
-        });
-        if device.last == Some(effective) && !selected_nonzero {
+        if device.last == Some(effective) && device.last_applied == Some(applied) {
             return Ok(applied);
         }
         if !dry_run {
             if let Some(path) = &device.path {
-                let mut options = fs::OpenOptions::new();
-                options.write(true);
-                if device.write_name.is_none() {
-                    options.truncate(true);
-                }
-                let mut file = options
-                    .open(path)
-                    .map_err(|error| format!("{}: {error}", path.display()))?;
-                if let Some(write_name) = &device.write_name {
-                    write!(file, "{write_name} {applied}")
-                        .map_err(|error| format!("{}: {error}", path.display()))?;
+                let payload = if let Some(write_name) = &device.write_name {
+                    format!("{write_name} {applied}")
                 } else {
-                    write!(file, "{applied}")
-                        .map_err(|error| format!("{}: {error}", path.display()))?;
-                }
+                    format!("{applied}")
+                };
+                fs::write(path, payload).map_err(|error| format!("{}: {error}", path.display()))?;
             }
         }
         device.last = Some(effective);
+        device.last_applied = Some(applied);
         Ok(applied)
     }
 
@@ -217,9 +208,36 @@ impl DeviceStore {
             .devices
             .get(name)
             .and_then(|device| device.lock().ok().and_then(|device| device.path.clone()));
-        path.and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|text| text.split_whitespace().last()?.parse().ok())
+        path.and_then(|path| self.read_cached_last_i64(&path))
             .unwrap_or(0)
+    }
+
+    fn cached_file(&self, path: &Path) -> Option<CachedFile> {
+        let mut cache = self.sysfs.lock().ok()?;
+        if let Some(cell) = cache.get(path) {
+            return Some(Arc::clone(cell));
+        }
+        let cell = Arc::new(Mutex::new(None));
+        cache.insert(path.to_path_buf(), Arc::clone(&cell));
+        Some(cell)
+    }
+
+    fn read_cached_i64(&self, path: &Path) -> Option<i64> {
+        let cell = self.cached_file(path)?;
+        let mut file = cell.lock().ok()?;
+        if file.is_none() {
+            *file = File::open(path).ok();
+        }
+        crate::sysfs::read_i64_file(file.as_mut()?)
+    }
+
+    fn read_cached_last_i64(&self, path: &Path) -> Option<i64> {
+        let cell = self.cached_file(path)?;
+        let mut file = cell.lock().ok()?;
+        if file.is_none() {
+            *file = File::open(path).ok();
+        }
+        crate::sysfs::read_last_i64_file(file.as_mut()?)
     }
 
     fn apply_battery_scale(&self, name: &str, target: i64) -> i64 {
@@ -242,9 +260,7 @@ impl DeviceStore {
     }
 
     pub fn read_sysfs_i64(&self, path: &str) -> Option<i64> {
-        fs::read_to_string(self.root.join(path))
-            .ok()
-            .and_then(|text| text.trim().parse().ok())
+        self.read_cached_i64(&self.root.join(path))
     }
 }
 
@@ -277,10 +293,9 @@ fn resolve_device(
     (cooling.get(&config.name).cloned(), None)
 }
 
-fn read_i64_file(path: &Path) -> Option<i64> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
+fn read_i64_path(path: &Path) -> Option<i64> {
+    let mut file = File::open(path).ok()?;
+    crate::sysfs::read_i64_file(&mut file)
 }
 
 fn read_cpu_levels(root: &Path, name: &str) -> Vec<i64> {
@@ -356,7 +371,10 @@ mod tests {
         fs::write(cpufreq.join("scaling_boost_frequencies"), "3000000\n").unwrap();
         let mut store = DeviceStore::new(&root, &[]);
         store.ensure(&root, "cpu0");
-        assert_eq!(store.levels("cpu0"), vec![3000000, 2000000, 1000000]);
+        assert_eq!(
+            store.levels("cpu0").as_deref(),
+            Some(&[3000000, 2000000, 1000000][..])
+        );
         assert_eq!(store.set_target("cpu0", 2000000, false).unwrap(), 2000000);
         assert_eq!(fs::read_to_string(&limits).unwrap(), "cpu0 2000000");
         let _ = fs::remove_dir_all(&root);
@@ -379,8 +397,8 @@ mod tests {
                 select_higher: false,
             }],
         );
-        assert_eq!(store.set_target_for("a", "lower", 200, false).unwrap(), 100);
-        assert_eq!(store.set_target_for("b", "lower", 50, false).unwrap(), 50);
+        assert_eq!(store.set_target_for(1, "lower", 200, false).unwrap(), 100);
+        assert_eq!(store.set_target_for(2, "lower", 50, false).unwrap(), 50);
         assert_eq!(fs::read_to_string(&path).unwrap(), "50");
 
         let higher = root.join("higher");
@@ -395,14 +413,8 @@ mod tests {
                 select_higher: true,
             }],
         );
-        assert_eq!(
-            store.set_target_for("a", "higher", 200, false).unwrap(),
-            200
-        );
-        assert_eq!(
-            store.set_target_for("b", "higher", 300, false).unwrap(),
-            300
-        );
+        assert_eq!(store.set_target_for(1, "higher", 200, false).unwrap(), 200);
+        assert_eq!(store.set_target_for(2, "higher", 300, false).unwrap(), 300);
         assert_eq!(fs::read_to_string(&higher).unwrap(), "300");
         let _ = fs::remove_dir_all(&root);
     }

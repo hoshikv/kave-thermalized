@@ -1,6 +1,8 @@
-use crate::sysfs::{find_zone_by_type, SysfsNode};
+use crate::sysfs::{find_zone_by_type, RawCache, SysfsNode};
+use std::sync::Arc;
 
 pub struct SensorSet {
+    cache: Arc<RawCache>,
     cpu_therm: Option<SysfsNode>,
     battery: Option<SysfsNode>,
     charger0: Option<SysfsNode>,
@@ -47,11 +49,12 @@ impl Default for Weights {
 }
 
 impl SensorSet {
-    pub fn probe() -> Self {
+    pub fn probe(cache: Arc<RawCache>) -> Self {
         let open_zone = |name: &str| -> Option<SysfsNode> {
             find_zone_by_type(name).and_then(|p| SysfsNode::open(&p))
         };
         Self {
+            cache,
             cpu_therm: open_zone("cpu_therm"),
             battery: open_zone("battery"),
             charger0: open_zone("charger_therm0"),
@@ -88,23 +91,26 @@ impl SensorSet {
             && self.quiet.is_some()
     }
 
-    fn read(node: &mut Option<SysfsNode>, fallback: i32) -> i32 {
-        node.as_mut().and_then(|n| n.read_i32()).unwrap_or(fallback)
+    fn read(node: &mut Option<SysfsNode>, fallback: i32, cache: &RawCache) -> i32 {
+        node.as_mut()
+            .and_then(|n| n.read_i32_cached(Some(cache)))
+            .unwrap_or(fallback)
     }
 
     pub fn read_all(&mut self, w: &Weights) -> Reading {
-        let t_cpu = Self::read(&mut self.cpu_therm, 25000);
-        let t_batt = Self::read(&mut self.battery, 25000);
-        let t_chg = Self::read(&mut self.charger0, 25000);
-        let t_wifi = Self::read(&mut self.wifi, 25000);
-        let t_pa0 = Self::read(&mut self.pa0, 25000);
-        let t_pa1 = Self::read(&mut self.pa1, 25000);
-        let t_quiet = Self::read(&mut self.quiet, 25000);
-        let t_conn = Self::read(&mut self.conn, 25000);
+        let cache = Arc::clone(&self.cache);
+        let t_cpu = Self::read(&mut self.cpu_therm, 25000, &cache);
+        let t_batt = Self::read(&mut self.battery, 25000, &cache);
+        let t_chg = Self::read(&mut self.charger0, 25000, &cache);
+        let t_wifi = Self::read(&mut self.wifi, 25000, &cache);
+        let t_pa0 = Self::read(&mut self.pa0, 25000, &cache);
+        let t_pa1 = Self::read(&mut self.pa1, 25000, &cache);
+        let t_quiet = Self::read(&mut self.quiet, 25000, &cache);
+        let t_conn = Self::read(&mut self.conn, 25000, &cache);
 
         let mut t_hotspot = 25000;
         for node in self.hotspot.iter_mut() {
-            if let Some(value) = node.as_mut().and_then(|n| n.read_i32()) {
+            if let Some(value) = node.as_mut().and_then(|n| n.read_i32_cached(Some(&cache))) {
                 if value > t_hotspot {
                     t_hotspot = value;
                 }
@@ -128,7 +134,7 @@ impl SensorSet {
             t_quiet
         };
 
-        let battery_ps = Self::read(&mut self.batt_temp_node, 25000);
+        let battery_ps = Self::read(&mut self.batt_temp_node, 25000, &cache);
         let battery_temp = if battery_ps > 1000 {
             battery_ps
         } else {
@@ -145,6 +151,9 @@ impl SensorSet {
         if !self.all_present() {
             crate::klog("warning: some thermal zones missing, using fallback values");
         }
-        let _ = self.conn.as_mut().and_then(|n| n.read_i32());
+        let _ = self
+            .conn
+            .as_mut()
+            .and_then(|n| n.read_i32_cached(Some(&self.cache)));
     }
 }

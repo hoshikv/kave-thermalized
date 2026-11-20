@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
 
 use crate::config::{Section, ThermalConfig};
@@ -111,11 +111,15 @@ impl AlgoState {
 pub struct WorkerGroup {
     stop: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
+    threads: Vec<Thread>,
 }
 
 impl WorkerGroup {
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        for thread in &self.threads {
+            thread.unpark();
+        }
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
@@ -123,9 +127,17 @@ impl WorkerGroup {
 }
 
 pub fn run_once(algos: Vec<Algo>, sensors: &SensorStore, devices: &DeviceStore, dry_run: bool) {
-    for algo in algos {
+    for (algo_id, algo) in algos.into_iter().enumerate() {
         let mut state = AlgoState::new(algo.count());
-        match evaluate(&algo, &mut state, sensors, devices, dry_run) {
+        match evaluate(
+            &algo,
+            &mut state,
+            sensors,
+            devices,
+            dry_run,
+            algo_id as u32,
+            true,
+        ) {
             Ok(result) => {
                 println!(
                     "{} sensor={} temp={} level={} writes={:?}",
@@ -146,7 +158,8 @@ pub fn start(
 ) -> WorkerGroup {
     let stop = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
-    for algo in algos {
+    let mut threads = Vec::new();
+    for (algo_id, algo) in algos.into_iter().enumerate() {
         if algo.disable {
             continue;
         }
@@ -160,10 +173,19 @@ pub fn start(
         let sensors = Arc::clone(&sensors);
         let devices = Arc::clone(&devices);
         let stop = Arc::clone(&stop);
-        handles.push(thread::spawn(move || {
+        let handle = thread::spawn(move || {
+            let algo_id = algo_id as u32;
+            let polling = algo.polling_ms.max(100);
+            let phase = (algo_id as u64)
+                .saturating_mul(97)
+                .checked_rem(polling)
+                .unwrap_or(0);
             let mut state = AlgoState::new(algo.count());
+            let mut first = true;
             while !stop.load(Ordering::Relaxed) {
-                match evaluate(&algo, &mut state, &sensors, &devices, dry_run) {
+                match evaluate(
+                    &algo, &mut state, &sensors, &devices, dry_run, algo_id, verbose,
+                ) {
                     Ok(result) => {
                         if verbose {
                             println!(
@@ -174,16 +196,23 @@ pub fn start(
                     }
                     Err(error) => eprintln!("{}: {error}", algo.name),
                 }
-                let mut slept = 0;
-                while slept < algo.polling_ms && !stop.load(Ordering::Relaxed) {
-                    let step = (algo.polling_ms - slept).min(100);
-                    thread::sleep(Duration::from_millis(step));
-                    slept += step;
-                }
+                let delay = if first {
+                    first = false;
+                    polling.saturating_add(phase)
+                } else {
+                    polling
+                };
+                thread::park_timeout(Duration::from_millis(delay));
             }
-        }));
+        });
+        threads.push(handle.thread().clone());
+        handles.push(handle);
     }
-    WorkerGroup { stop, handles }
+    WorkerGroup {
+        stop,
+        handles,
+        threads,
+    }
 }
 
 fn evaluate(
@@ -192,6 +221,8 @@ fn evaluate(
     sensors: &SensorStore,
     devices: &DeviceStore,
     dry_run: bool,
+    algo_id: u32,
+    report: bool,
 ) -> Result<EvalResult, String> {
     let temp = sensors.read(&algo.sensor)?;
     let count = algo.count();
@@ -209,7 +240,7 @@ fn evaluate(
         (0, 0)
     };
 
-    let (sic_max, sic_min) = if matches!(algo.kind, AlgoKind::Sic) {
+    let (sic_max, sic_min, usb_online) = if matches!(algo.kind, AlgoKind::Sic) {
         let charger_temp = devices
             .read_sysfs_i64("sys/class/thermal/thermal_message/charger_temp")
             .filter(|value| *value < 9)
@@ -222,14 +253,14 @@ fn evaluate(
         } else {
             charger_temp * 1000
         };
-        sic_limits(algo, algo.devices.len(), offset)
+        let (max, min) = sic_limits(algo, algo.devices.len(), offset);
+        let usb_online = devices
+            .read_sysfs_i64("sys/class/thermal/thermal_message/usb_online")
+            .unwrap_or(-22);
+        (max, min, usb_online)
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), 0)
     };
-
-    let usb_online = devices
-        .read_sysfs_i64("sys/class/thermal/thermal_message/usb_online")
-        .unwrap_or(-22);
     let cpu_nolimit = if matches!(algo.kind, AlgoKind::Ss) {
         devices
             .read_sysfs_i64("sys/class/thermal/thermal_message/cpu_nolimit_temp")
@@ -238,7 +269,11 @@ fn evaluate(
         i64::MIN
     };
 
-    let mut writes = Vec::new();
+    let mut writes = if report {
+        Vec::with_capacity(algo.devices.len())
+    } else {
+        Vec::new()
+    };
     for (index, device) in algo.devices.iter().enumerate() {
         let use_default = level < 0
             || (matches!(algo.kind, AlgoKind::Ss)
@@ -256,14 +291,17 @@ fn evaluate(
                 ss_target(
                     target,
                     devices.default_target(device),
-                    &levels,
+                    levels.as_deref().unwrap_or(&[]),
                     &mut state.last_level,
                 )
             }
             AlgoKind::Monitor => {
-                let levels = devices.levels(device);
                 if target == 0 {
-                    levels.first().copied().unwrap_or(0)
+                    devices
+                        .levels(device)
+                        .as_ref()
+                        .and_then(|levels| levels.first().copied())
+                        .unwrap_or(0)
                 } else {
                     target
                 }
@@ -289,9 +327,13 @@ fn evaluate(
             target
         };
 
-        let requester = format!("{}#{index}", algo.name);
-        match devices.set_target_for(&requester, device, target, dry_run) {
-            Ok(effective) => writes.push((device.clone(), effective)),
+        let requester = algo_id.saturating_mul(1024).saturating_add(index as u32);
+        match devices.set_target_for(requester, device, target, dry_run) {
+            Ok(effective) => {
+                if report {
+                    writes.push((device.clone(), effective));
+                }
+            }
             Err(error) => eprintln!("{}: {error}", algo.name),
         }
     }
