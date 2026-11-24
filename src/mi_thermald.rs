@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -140,6 +141,7 @@ fn watch(args: Options, runtime: Runtime, stop: Arc<AtomicBool>) -> Result<(), S
         return Ok(());
     }
 
+    let region_map = region_map_path(&args);
     let mut last = read_i64(&sconfig).unwrap_or(-1);
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(500));
@@ -156,13 +158,30 @@ fn watch(args: Options, runtime: Runtime, stop: Arc<AtomicBool>) -> Result<(), S
         if !(0..=0x800).contains(&value) {
             continue;
         }
-        match resolve_config(&args, value) {
+        let resolved = match region_map.as_deref() {
+            Some(map) => match resolve_config_with_map(&args, value, Some(map)) {
+                Ok(Some(path)) => Ok(Some(path)),
+                Ok(None) => resolve_config(&args, value),
+                Err(error) => Err(error),
+            },
+            None => resolve_config(&args, value),
+        };
+        match resolved {
             Ok(Some(path)) => match build_runtime(&args, &path) {
                 Ok(runtime) => {
                     if args.verbose {
                         println!("switch config sconfig={value} path={}", path.display());
                     }
                     group.stop();
+                    let active_devices: HashSet<&str> = runtime
+                        .algos
+                        .iter()
+                        .filter(|algo| !algo.disable)
+                        .flat_map(|algo| algo.devices.iter().map(String::as_str))
+                        .collect();
+                    runtime
+                        .devices
+                        .reset_unused_from(&devices, &active_devices, args.dry_run);
                     runtime.devices.copy_state_from(&devices);
                     runtime.sensors.copy_state_from(&sensors);
                     let Runtime {

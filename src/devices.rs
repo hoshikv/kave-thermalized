@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -108,6 +108,39 @@ impl DeviceStore {
         };
         self.devices
             .insert(name.to_owned(), Arc::new(Mutex::new(device)));
+    }
+
+    pub fn reset_unused_from(
+        &self,
+        old: &DeviceStore,
+        active_devices: &HashSet<&str>,
+        dry_run: bool,
+    ) {
+        for (name, old_device) in &old.devices {
+            if active_devices.contains(name.as_str()) {
+                continue;
+            }
+            let Ok(old_device) = old_device.lock() else {
+                continue;
+            };
+            if old_device.last.is_none() || old_device.last == Some(old_device.def_target) {
+                continue;
+            }
+            let applied = self.apply_battery_scale(name, old_device.def_target);
+            if old_device.last_applied == Some(applied) {
+                continue;
+            }
+            if !dry_run {
+                if let Some(path) = &old_device.path {
+                    let payload = if let Some(write_name) = &old_device.write_name {
+                        format!("{write_name} {applied}")
+                    } else {
+                        format!("{applied}")
+                    };
+                    let _ = fs::write(path, payload);
+                }
+            }
+        }
     }
 
     pub fn copy_state_from(&self, old: &DeviceStore) {

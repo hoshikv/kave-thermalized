@@ -11,7 +11,6 @@ pub struct SensorSet {
     pa1: Option<SysfsNode>,
     quiet: Option<SysfsNode>,
     conn: Option<SysfsNode>,
-    hotspot: Vec<Option<SysfsNode>>,
     batt_temp_node: Option<SysfsNode>,
 }
 
@@ -28,22 +27,23 @@ pub struct Weights {
     pub pa0: i32,
     pub pa1: i32,
     pub quiet: i32,
-    pub conn: i32,
-    pub hotspot: i32,
+    pub weight_sum: i32,
+    pub compensation: i32,
 }
 
 impl Default for Weights {
     fn default() -> Self {
+        // Matches stock peridot VIRTUAL-SENSOR0 in thermal-normal.conf.
         Self {
-            cpu: 200,
-            batt: 200,
-            chg: 100,
-            wifi: 60,
-            pa0: 40,
-            pa1: 80,
-            quiet: 150,
-            conn: 100,
-            hotspot: 60,
+            cpu: -26,
+            batt: 301,
+            chg: 147,
+            wifi: 330,
+            pa0: 36,
+            pa1: 119,
+            quiet: -2,
+            weight_sum: 1000,
+            compensation: 2015,
         }
     }
 }
@@ -63,20 +63,6 @@ impl SensorSet {
             pa1: open_zone("pa_therm1"),
             quiet: open_zone("quiet_therm"),
             conn: open_zone("conn_therm"),
-            hotspot: [
-                "aoss-0".to_string(),
-                "cpuss-0".to_string(),
-                "cpuss-1".to_string(),
-                "ddr".to_string(),
-                "video".to_string(),
-                "camera-0".to_string(),
-                "camera-1".to_string(),
-                "nsphvx-0".to_string(),
-                "nsphmx-0".to_string(),
-            ]
-            .iter()
-            .map(|n| open_zone(n))
-            .collect(),
             batt_temp_node: SysfsNode::open("/sys/class/power_supply/battery/temp"),
         }
     }
@@ -106,33 +92,15 @@ impl SensorSet {
         let t_pa0 = Self::read(&mut self.pa0, 25000, &cache);
         let t_pa1 = Self::read(&mut self.pa1, 25000, &cache);
         let t_quiet = Self::read(&mut self.quiet, 25000, &cache);
-        let t_conn = Self::read(&mut self.conn, 25000, &cache);
-
-        let mut t_hotspot = 25000;
-        for node in self.hotspot.iter_mut() {
-            if let Some(value) = node.as_mut().and_then(|n| n.read_i32_cached(Some(&cache))) {
-                if value > t_hotspot {
-                    t_hotspot = value;
-                }
-            }
-        }
-
-        let sum = w.cpu + w.batt + w.chg + w.wifi + w.pa0 + w.pa1 + w.quiet + w.conn + w.hotspot;
-
-        let virtual_temp = if sum > 0 {
-            (w.cpu * t_cpu
-                + w.batt * t_batt
-                + w.chg * t_chg
-                + w.wifi * t_wifi
-                + w.pa0 * t_pa0
-                + w.pa1 * t_pa1
-                + w.quiet * t_quiet
-                + w.conn * t_conn
-                + w.hotspot * t_hotspot)
-                / sum
-        } else {
-            t_quiet
-        };
+        let divisor = if w.weight_sum == 0 { 1 } else { w.weight_sum };
+        let weighted_sum = i64::from(w.cpu) * i64::from(t_cpu)
+            + i64::from(w.batt) * i64::from(t_batt)
+            + i64::from(w.chg) * i64::from(t_chg)
+            + i64::from(w.wifi) * i64::from(t_wifi)
+            + i64::from(w.pa0) * i64::from(t_pa0)
+            + i64::from(w.pa1) * i64::from(t_pa1)
+            + i64::from(w.quiet) * i64::from(t_quiet);
+        let virtual_temp = (weighted_sum / i64::from(divisor)) as i32 + w.compensation;
 
         let battery_ps = Self::read(&mut self.batt_temp_node, 25000, &cache);
         let battery_temp = if battery_ps > 1000 {

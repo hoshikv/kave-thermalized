@@ -514,9 +514,13 @@ impl IThermal for ThermalServiceImpl {
         {
             return Err(rsbinder::StatusCode::BadValue.into());
         }
+        let filter = match arg_type {
+            TemperatureType::UNKNOWN => None,
+            _ => Some(ttype_to_int(&arg_type)),
+        };
         entries.push(CallbackEntry {
             cb: arg_callback.clone(),
-            filter: Some(ttype_to_int(&arg_type)),
+            filter,
         });
         Ok(())
     }

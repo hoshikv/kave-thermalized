@@ -29,7 +29,7 @@ struct SensorHistory {
     last2: i64,
 }
 
-const VIRTUAL_CACHE_TTL: Duration = Duration::from_millis(4000);
+const VIRTUAL_CACHE_TTL: Duration = Duration::from_millis(800);
 
 #[derive(Clone, Copy, Debug)]
 struct VirtualCache {
@@ -122,7 +122,24 @@ impl SensorStore {
     }
 
     pub fn read(&self, name: &str) -> Result<i64, String> {
-        self.read_inner(name, 0)
+        self.read_inner(name, 0, false)
+    }
+
+    fn record_history(&self, name: &str, value: i64) {
+        if let Ok(mut history) = self.history.lock() {
+            history
+                .entry(name.to_owned())
+                .and_modify(|entry| {
+                    entry.last2 = entry.last;
+                    entry.last = entry.current;
+                    entry.current = value;
+                })
+                .or_insert(SensorHistory {
+                    current: value,
+                    last: value,
+                    last2: value,
+                });
+        }
     }
 
     pub fn copy_state_from(&self, old: &SensorStore) {
@@ -160,7 +177,7 @@ impl SensorStore {
         names
     }
 
-    fn read_inner(&self, name: &str, depth: usize) -> Result<i64, String> {
+    fn read_inner(&self, name: &str, depth: usize, bypass_cache: bool) -> Result<i64, String> {
         if depth > 8 {
             return Err(format!("virtual sensor recursion at {name}"));
         }
@@ -169,22 +186,41 @@ impl SensorStore {
         };
         match def {
             SensorDef::Generic { path } | SensorDef::Simulated { path } => {
-                self.read_file(name, path)
+                let (value, fresh) = if bypass_cache {
+                    self.raw_cache.invalidate(path);
+                    let value = self.read_file_uncached(name, path)?;
+                    self.raw_cache.put(path, value);
+                    (value, true)
+                } else if let Some(cached) = self.raw_cache.get(path) {
+                    (cached, false)
+                } else {
+                    let value = self.read_file_uncached(name, path)?;
+                    self.raw_cache.put(path, value);
+                    (value, true)
+                };
+                if fresh && depth == 0 {
+                    self.record_history(name, value);
+                }
+                Ok(value)
             }
             SensorDef::Virtual {
                 members,
                 weight_sum,
                 compensation,
             } => {
-                if let Some(value) = self.cached_virtual(name) {
-                    return Ok(value);
+                if !bypass_cache {
+                    if let Some(value) = self.cached_virtual(name) {
+                        return Ok(value);
+                    }
                 }
                 let _guard = self
                     .virtual_lock
                     .lock()
                     .map_err(|_| format!("virtual sensor lock for {name} poisoned"))?;
-                if let Some(value) = self.cached_virtual(name) {
-                    return Ok(value);
+                if !bypass_cache {
+                    if let Some(value) = self.cached_virtual(name) {
+                        return Ok(value);
+                    }
                 }
                 let last = self
                     .history
@@ -196,9 +232,9 @@ impl SensorStore {
                 loop {
                     let mut sum = 0;
                     for (member, weight) in members {
-                        let mut value = self.read_inner(member, depth + 1).unwrap_or(0);
+                        let mut value = self.read_inner(member, depth + 1, bypass_cache).unwrap_or(0);
                         if matches!(value, -40000 | 125000 | 0) {
-                            value = self.read_inner(member, depth + 1).unwrap_or(0);
+                            value = self.read_inner(member, depth + 1, true).unwrap_or(0);
                         }
                         sum += value.saturating_mul(*weight);
                     }
@@ -216,6 +252,7 @@ impl SensorStore {
                                 },
                             );
                         }
+                        self.record_history(name, value);
                         return Ok(value);
                     }
                     retries += 1;
@@ -230,15 +267,6 @@ impl SensorStore {
         let cache = self.virtual_cache.lock().ok()?;
         let entry = cache.get(name)?;
         (entry.at.elapsed() < VIRTUAL_CACHE_TTL).then_some(entry.value)
-    }
-
-    fn read_file(&self, name: &str, path: &Path) -> Result<i64, String> {
-        if let Some(value) = self.raw_cache.get(path) {
-            return Ok(value);
-        }
-        let value = self.read_file_uncached(name, path)?;
-        self.raw_cache.put(path, value);
-        Ok(value)
     }
 
     fn read_file_uncached(&self, name: &str, path: &Path) -> Result<i64, String> {
@@ -339,6 +367,7 @@ mod tests {
         );
         let store = SensorStore::new(&root, &config).unwrap();
         assert_eq!(store.read("V").unwrap(), 10010);
+        assert_eq!(store.history("V"), (10010, 10010));
         let _ = fs::remove_dir_all(&root);
     }
 }

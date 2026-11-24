@@ -81,6 +81,13 @@ impl Algo {
         match self.kind {
             AlgoKind::Monitor => self.trig.len().min(self.clr.len()),
             AlgoKind::Sic => self.trig.len().min(self.clr.len()).min(self.targets.len()),
+            AlgoKind::Ss => {
+                if self.clr.is_empty() {
+                    self.trig.len()
+                } else {
+                    self.trig.len().min(self.clr.len())
+                }
+            }
             _ => self.trig.len(),
         }
     }
@@ -96,14 +103,14 @@ pub struct EvalResult {
 #[derive(Clone, Debug)]
 pub struct AlgoState {
     levels: Vec<bool>,
-    last_level: i64,
+    last_levels: Vec<i64>,
 }
 
 impl AlgoState {
-    fn new(count: usize) -> Self {
+    fn new(count: usize, device_count: usize) -> Self {
         Self {
             levels: vec![false; count],
-            last_level: 0,
+            last_levels: vec![0; device_count.max(1)],
         }
     }
 }
@@ -128,7 +135,7 @@ impl WorkerGroup {
 
 pub fn run_once(algos: Vec<Algo>, sensors: &SensorStore, devices: &DeviceStore, dry_run: bool) {
     for (algo_id, algo) in algos.into_iter().enumerate() {
-        let mut state = AlgoState::new(algo.count());
+        let mut state = AlgoState::new(algo.count(), algo.devices.len());
         match evaluate(
             &algo,
             &mut state,
@@ -180,7 +187,7 @@ pub fn start(
                 .saturating_mul(97)
                 .checked_rem(polling)
                 .unwrap_or(0);
-            let mut state = AlgoState::new(algo.count());
+            let mut state = AlgoState::new(algo.count(), algo.devices.len());
             let mut first = true;
             while !stop.load(Ordering::Relaxed) {
                 match evaluate(
@@ -228,7 +235,13 @@ fn evaluate(
     let count = algo.count();
     let level = match algo.kind {
         AlgoKind::Monitor | AlgoKind::Sic => monitor_level(algo, &mut state.levels, temp, count),
-        AlgoKind::Ss => threshold_level(algo, temp, count),
+        AlgoKind::Ss => {
+            if algo.clr.is_empty() {
+                threshold_level(algo, temp, count)
+            } else {
+                monitor_level(algo, &mut state.levels, temp, count)
+            }
+        }
         AlgoKind::Chrono => {
             return Err(format!("{:?} is not implemented yet", algo.kind));
         }
@@ -288,11 +301,12 @@ fn evaluate(
         let target = match algo.kind {
             AlgoKind::Ss => {
                 let levels = devices.levels(device);
+                let last_level = state.last_levels.get_mut(index).unwrap();
                 ss_target(
                     target,
                     devices.default_target(device),
                     levels.as_deref().unwrap_or(&[]),
-                    &mut state.last_level,
+                    last_level,
                 )
             }
             AlgoKind::Monitor => {

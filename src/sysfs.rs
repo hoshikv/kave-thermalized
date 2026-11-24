@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const RAW_CACHE_TTL: Duration = Duration::from_millis(4000);
+const RAW_CACHE_TTL: Duration = Duration::from_millis(800);
 
 #[derive(Clone, Copy, Debug)]
 struct CachedValue {
@@ -34,6 +34,12 @@ impl RawCache {
                     at: Instant::now(),
                 },
             );
+        }
+    }
+
+    pub fn invalidate(&self, path: &Path) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(path);
         }
     }
 
