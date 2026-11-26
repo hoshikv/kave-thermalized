@@ -81,7 +81,8 @@ fn binder_thread(shared: Arc<hal::SharedState>) {
 struct PublishCache {
     raw_cache: Arc<RawCache>,
     zones: HashMap<String, Option<SysfsNode>>,
-    cooling: [(&'static str, Option<SysfsNode>); 5],
+    cooling: [(&'static str, &'static str, Option<SysfsNode>); 5],
+    last_reprobe: Option<std::time::Instant>,
 }
 
 impl PublishCache {
@@ -99,16 +100,17 @@ impl PublishCache {
             .map(|(name, kind)| {
                 (
                     name,
+                    kind,
                     find_cdev_by_type(kind).and_then(|path| SysfsNode::open(&path)),
                 )
             }),
+            last_reprobe: None,
         }
     }
 
     fn read_zone(&mut self, zone: &str) -> Option<f32> {
-        if let Some(node) = self.zones.get_mut(zone) {
+        if let Some(Some(node)) = self.zones.get_mut(zone) {
             return node
-                .as_mut()?
                 .read_i32_cached(Some(&self.raw_cache))
                 .map(|value| value as f32);
         }
@@ -117,13 +119,28 @@ impl PublishCache {
             .as_mut()
             .and_then(|node| node.read_i32_cached(Some(&self.raw_cache)))
             .map(|value| value as f32);
-        self.zones.insert(zone.to_owned(), node);
+        if node.is_some() {
+            self.zones.insert(zone.to_owned(), node);
+        }
         value
     }
 
     fn cooling_states(&mut self) -> [(&'static str, i64); 5] {
+        let should_reprobe = self.cooling.iter().any(|(_, _, n)| n.is_none())
+            && self
+                .last_reprobe
+                .map(|t| t.elapsed() >= Duration::from_secs(5))
+                .unwrap_or(true);
+        if should_reprobe {
+            self.last_reprobe = Some(std::time::Instant::now());
+            for (_, kind, node) in self.cooling.iter_mut() {
+                if node.is_none() {
+                    *node = find_cdev_by_type(kind).and_then(|path| SysfsNode::open(&path));
+                }
+            }
+        }
         let mut states = [("", 0); 5];
-        for (state, (name, node)) in states.iter_mut().zip(self.cooling.iter_mut()) {
+        for (state, (name, _, node)) in states.iter_mut().zip(self.cooling.iter_mut()) {
             let value = node
                 .as_mut()
                 .and_then(|node| node.read_i32())

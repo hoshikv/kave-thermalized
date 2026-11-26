@@ -99,14 +99,17 @@ pub fn read_last_i64_file(file: &mut File) -> Option<i64> {
 }
 
 pub fn find_zone_by_type(zone_type: &str) -> Option<String> {
-    for idx in 0..128 {
-        let type_path = format!("/sys/class/thermal/thermal_zone{}/type", idx);
-        if !Path::new(&type_path).exists() {
-            break;
+    let entries = std::fs::read_dir("/sys/class/thermal").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("thermal_zone") {
+            continue;
         }
-        if let Ok(t) = std::fs::read_to_string(&type_path) {
+        let dir = entry.path();
+        if let Ok(t) = std::fs::read_to_string(dir.join("type")) {
             if t.trim() == zone_type {
-                return Some(format!("/sys/class/thermal/thermal_zone{}/temp", idx));
+                return Some(dir.join("temp").to_string_lossy().into_owned());
             }
         }
     }
@@ -114,17 +117,17 @@ pub fn find_zone_by_type(zone_type: &str) -> Option<String> {
 }
 
 pub fn find_cdev_by_type(cdev_type: &str) -> Option<String> {
-    for idx in 0..128 {
-        let type_path = format!("/sys/class/thermal/cooling_device{}/type", idx);
-        if !Path::new(&type_path).exists() {
-            break;
+    let entries = std::fs::read_dir("/sys/class/thermal").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("cooling_device") {
+            continue;
         }
-        if let Ok(t) = std::fs::read_to_string(&type_path) {
+        let dir = entry.path();
+        if let Ok(t) = std::fs::read_to_string(dir.join("type")) {
             if t.trim() == cdev_type {
-                return Some(format!(
-                    "/sys/class/thermal/cooling_device{}/cur_state",
-                    idx
-                ));
+                return Some(dir.join("cur_state").to_string_lossy().into_owned());
             }
         }
     }

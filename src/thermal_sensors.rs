@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::ThermalConfig;
 use crate::sysfs::RawCache;
+
+const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub enum SensorDef {
@@ -40,8 +42,9 @@ struct VirtualCache {
 #[derive(Clone, Debug)]
 pub struct SensorStore {
     root: PathBuf,
-    defs: HashMap<String, SensorDef>,
-    files: HashMap<String, Arc<Mutex<Option<File>>>>,
+    defs: Arc<RwLock<HashMap<String, SensorDef>>>,
+    files: Arc<RwLock<HashMap<String, Arc<Mutex<Option<File>>>>>>,
+    last_rescan: Arc<Mutex<Option<Instant>>>,
     board_comp: Arc<Mutex<Option<File>>>,
     history: Arc<Mutex<HashMap<String, SensorHistory>>>,
     virtual_lock: Arc<Mutex<()>>,
@@ -111,14 +114,46 @@ impl SensorStore {
 
         Ok(Self {
             root: root.to_path_buf(),
-            defs,
-            files,
+            defs: Arc::new(RwLock::new(defs)),
+            files: Arc::new(RwLock::new(files)),
+            last_rescan: Arc::new(Mutex::new(None)),
             board_comp: Arc::new(Mutex::new(None)),
             history: Arc::new(Mutex::new(HashMap::new())),
             virtual_lock: Arc::new(Mutex::new(())),
             virtual_cache: Arc::new(Mutex::new(HashMap::new())),
             raw_cache,
         })
+    }
+
+    fn rescan_zones_if_needed(&self) {
+        let Ok(mut last) = self.last_rescan.lock() else {
+            return;
+        };
+        if let Some(at) = *last {
+            if at.elapsed() < RESCAN_INTERVAL {
+                return;
+            }
+        }
+        *last = Some(Instant::now());
+        drop(last);
+
+        let Ok(scanned) = scan_thermal_zones(&self.root) else {
+            return;
+        };
+        let Ok(mut defs) = self.defs.write() else {
+            return;
+        };
+        let Ok(mut files) = self.files.write() else {
+            return;
+        };
+        for (name, def) in scanned {
+            if !defs.contains_key(&name) {
+                defs.insert(name.clone(), def);
+                files
+                    .entry(name)
+                    .or_insert_with(|| Arc::new(Mutex::new(None)));
+            }
+        }
     }
 
     pub fn read(&self, name: &str) -> Result<i64, String> {
@@ -146,9 +181,12 @@ impl SensorStore {
         let Ok(old_history) = old.history.lock() else {
             return;
         };
+        let Ok(defs) = self.defs.read() else {
+            return;
+        };
         if let Ok(mut history) = self.history.lock() {
             for (name, value) in old_history.iter() {
-                if self.defs.contains_key(name) {
+                if defs.contains_key(name) {
                     history.insert(name.clone(), *value);
                 }
             }
@@ -168,23 +206,47 @@ impl SensorStore {
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.defs.contains_key(name)
+        if self
+            .defs
+            .read()
+            .map(|defs| defs.contains_key(name))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.rescan_zones_if_needed();
+        self.defs
+            .read()
+            .map(|defs| defs.contains_key(name))
+            .unwrap_or(false)
     }
 
-    pub fn names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.defs.keys().map(String::as_str).collect();
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .defs
+            .read()
+            .map(|defs| defs.keys().cloned().collect())
+            .unwrap_or_default();
         names.sort_unstable();
         names
+    }
+
+    fn get_def(&self, name: &str) -> Option<SensorDef> {
+        if let Some(def) = self.defs.read().ok().and_then(|d| d.get(name).cloned()) {
+            return Some(def);
+        }
+        self.rescan_zones_if_needed();
+        self.defs.read().ok().and_then(|d| d.get(name).cloned())
     }
 
     fn read_inner(&self, name: &str, depth: usize, bypass_cache: bool) -> Result<i64, String> {
         if depth > 8 {
             return Err(format!("virtual sensor recursion at {name}"));
         }
-        let Some(def) = self.defs.get(name) else {
+        let Some(def) = self.get_def(name) else {
             return Err(format!("unknown sensor {name}"));
         };
-        match def {
+        match &def {
             SensorDef::Generic { path } | SensorDef::Simulated { path } => {
                 let (value, fresh) = if bypass_cache {
                     self.raw_cache.invalidate(path);
@@ -270,7 +332,8 @@ impl SensorStore {
     }
 
     fn read_file_uncached(&self, name: &str, path: &Path) -> Result<i64, String> {
-        let Some(cell) = self.files.get(name) else {
+        let cell = self.files.read().ok().and_then(|f| f.get(name).cloned());
+        let Some(cell) = cell else {
             return read_i64(path);
         };
         let mut file = cell
@@ -368,6 +431,36 @@ mod tests {
         let store = SensorStore::new(&root, &config).unwrap();
         assert_eq!(store.read("V").unwrap(), 10010);
         assert_eq!(store.history("V"), (10010, 10010));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn late_appearing_zone_is_rescanned() {
+        let root = std::env::temp_dir().join(format!(
+            "mi_thermald_late_zone_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let z0 = root.join("sys/class/thermal/thermal_zone0");
+        fs::create_dir_all(&z0).unwrap();
+        fs::write(z0.join("type"), "cpu_therm\n").unwrap();
+        fs::write(z0.join("temp"), "40000\n").unwrap();
+
+        let config = parse_thermal(
+            "[V]\nalgo_type Virtual\nsensors\tcpu_therm battery\nweight\t500 500\nweight_sum\t1000\ncompensation\t0\n",
+        );
+        let store = SensorStore::new(&root, &config).unwrap();
+        assert!(!store.contains("battery"));
+
+        // Register battery zone after startup and force rescan window to expire
+        let z60 = root.join("sys/class/thermal/thermal_zone60");
+        fs::create_dir_all(&z60).unwrap();
+        fs::write(z60.join("type"), "battery\n").unwrap();
+        fs::write(z60.join("temp"), "42000\n").unwrap();
+        *store.last_rescan.lock().unwrap() = None;
+
+        assert_eq!(store.read("battery").unwrap(), 42000);
+        assert_eq!(store.read("V").unwrap(), 41000);
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -1,5 +1,8 @@
 use crate::sysfs::{find_zone_by_type, RawCache, SysfsNode};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const REPROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct SensorSet {
     cache: Arc<RawCache>,
@@ -12,6 +15,7 @@ pub struct SensorSet {
     quiet: Option<SysfsNode>,
     conn: Option<SysfsNode>,
     batt_temp_node: Option<SysfsNode>,
+    last_reprobe: Option<Instant>,
 }
 
 pub struct Reading {
@@ -64,6 +68,7 @@ impl SensorSet {
             quiet: open_zone("quiet_therm"),
             conn: open_zone("conn_therm"),
             batt_temp_node: SysfsNode::open("/sys/class/power_supply/battery/temp"),
+            last_reprobe: None,
         }
     }
 
@@ -75,18 +80,80 @@ impl SensorSet {
             && self.pa0.is_some()
             && self.pa1.is_some()
             && self.quiet.is_some()
+            && self.batt_temp_node.is_some()
+    }
+
+    fn reprobe_missing(&mut self) {
+        if self.all_present() && self.conn.is_some() {
+            return;
+        }
+        if let Some(last) = self.last_reprobe {
+            if last.elapsed() < REPROBE_INTERVAL {
+                return;
+            }
+        }
+        self.last_reprobe = Some(Instant::now());
+        let open_zone = |name: &str| -> Option<SysfsNode> {
+            find_zone_by_type(name).and_then(|p| SysfsNode::open(&p))
+        };
+        if self.cpu_therm.is_none() {
+            self.cpu_therm = open_zone("cpu_therm");
+        }
+        if self.battery.is_none() {
+            self.battery = open_zone("battery");
+            if self.battery.is_some() {
+                crate::klog("late-probed thermal zone: battery");
+            }
+        }
+        if self.charger0.is_none() {
+            self.charger0 = open_zone("charger_therm0");
+        }
+        if self.wifi.is_none() {
+            self.wifi = open_zone("wifi_therm");
+        }
+        if self.pa0.is_none() {
+            self.pa0 = open_zone("pa_therm0");
+        }
+        if self.pa1.is_none() {
+            self.pa1 = open_zone("pa_therm1");
+        }
+        if self.quiet.is_none() {
+            self.quiet = open_zone("quiet_therm");
+        }
+        if self.conn.is_none() {
+            self.conn = open_zone("conn_therm");
+        }
+        if self.batt_temp_node.is_none() {
+            self.batt_temp_node = SysfsNode::open("/sys/class/power_supply/battery/temp");
+            if self.batt_temp_node.is_some() {
+                crate::klog("late-probed power_supply/battery/temp");
+            }
+        }
+    }
+
+    fn read_opt(node: &mut Option<SysfsNode>, cache: &RawCache) -> Option<i32> {
+        node.as_mut().and_then(|n| n.read_i32_cached(Some(cache)))
     }
 
     fn read(node: &mut Option<SysfsNode>, fallback: i32, cache: &RawCache) -> i32 {
-        node.as_mut()
-            .and_then(|n| n.read_i32_cached(Some(cache)))
-            .unwrap_or(fallback)
+        Self::read_opt(node, cache).unwrap_or(fallback)
     }
 
     pub fn read_all(&mut self, w: &Weights) -> Reading {
+        self.reprobe_missing();
         let cache = Arc::clone(&self.cache);
         let t_cpu = Self::read(&mut self.cpu_therm, 25000, &cache);
-        let t_batt = Self::read(&mut self.battery, 25000, &cache);
+        let batt_ps_mc = Self::read_opt(&mut self.batt_temp_node, &cache).map(|v| {
+            // power_supply/battery/temp is typically in tenths of °C (e.g. 419 -> 41900 m°C).
+            if v > -1000 && v <= 1000 {
+                v * 100
+            } else {
+                v
+            }
+        });
+        let t_batt = Self::read_opt(&mut self.battery, &cache)
+            .or(batt_ps_mc)
+            .unwrap_or(25000);
         let t_chg = Self::read(&mut self.charger0, 25000, &cache);
         let t_wifi = Self::read(&mut self.wifi, 25000, &cache);
         let t_pa0 = Self::read(&mut self.pa0, 25000, &cache);
@@ -102,12 +169,7 @@ impl SensorSet {
             + i64::from(w.quiet) * i64::from(t_quiet);
         let virtual_temp = (weighted_sum / i64::from(divisor)) as i32 + w.compensation;
 
-        let battery_ps = Self::read(&mut self.batt_temp_node, 25000, &cache);
-        let battery_temp = if battery_ps > 1000 {
-            battery_ps
-        } else {
-            t_batt
-        };
+        let battery_temp = batt_ps_mc.unwrap_or(t_batt);
 
         Reading {
             virtual_temp,
