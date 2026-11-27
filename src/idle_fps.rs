@@ -126,33 +126,67 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
         }
 
         if in_idle_60 {
-            // At 60Hz: block in kernel poll() for instant (<1ms) wake on first touch,
-            // waking at most once every 2s to re-check screen_state/settings.
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let rc = unsafe { libc::poll(&mut pfd, 1, 2000) };
-            if rc > 0 && (pfd.revents & libc::POLLIN) != 0 {
-                drain_fd(&mut touch_file, &mut drain_buf);
-                // Ignore AOD/FOD touches while screen is off.
-                if !is_screen_on() {
-                    was_screen_on = false;
-                    last_state_check = Instant::now() - Duration::from_secs(10);
-                    continue;
+            // At 60Hz: block in kernel poll() on both touchscreen and power key for instant
+            // (<1ms) wake to 120Hz on first touch OR power-key press (covers screen-off/on
+            // transitions before doze and ColorOS fake-AOD where screen_state stays 1).
+            let mut pfds = [
+                libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: pwrkey_file.as_ref().map_or(-1, |f| f.as_raw_fd()),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let nfds: libc::nfds_t = if pwrkey_file.is_some() { 2 } else { 1 };
+            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 2000) };
+            if rc > 0 {
+                let touch_ev = (pfds[0].revents & libc::POLLIN) != 0;
+                let pwr_ev = nfds == 2 && (pfds[1].revents & libc::POLLIN) != 0;
+                if touch_ev {
+                    drain_fd(&mut touch_file, &mut drain_buf);
                 }
-                last_touch = Instant::now();
-                if sf.set_mode(MODE_ACTIVE_120HZ) {
-                    let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
-                    in_idle_60 = false;
+                if pwr_ev {
+                    if let Some(f) = pwrkey_file.as_mut() {
+                        drain_fd(f, &mut drain_buf);
+                    }
+                }
+                if touch_ev || pwr_ev {
+                    if pwr_ev && !is_screen_on() {
+                        // Power key may be waking the panel from screen-off before screen_state
+                        // flips to 1; wait briefly instead of dropping into a 5s screen-off poll.
+                        for _ in 0..8 {
+                            if shutdown.load(Ordering::Relaxed) || is_screen_on() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                    // Ignore AOD/FOD touches while screen is off.
+                    if !is_screen_on() {
+                        was_screen_on = false;
+                        last_state_check = Instant::now() - Duration::from_secs(10);
+                        continue;
+                    }
+                    last_touch = Instant::now();
+                    if sf.set_mode(MODE_ACTIVE_120HZ) {
+                        let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
+                        in_idle_60 = false;
+                    }
                 }
             }
         } else {
             // At 120Hz: never wake at 240Hz during scrolling — sleep 500ms, then drain any
-            // accumulated touch events in a single non-blocking read.
+            // accumulated touch or power-key events in a single non-blocking read.
             thread::sleep(Duration::from_millis(500));
-            if drain_fd(&mut touch_file, &mut drain_buf) {
+            let saw_touch = drain_fd(&mut touch_file, &mut drain_buf);
+            let saw_pwr = pwrkey_file
+                .as_mut()
+                .map_or(false, |f| drain_fd(f, &mut drain_buf));
+            if saw_touch || saw_pwr {
                 last_touch = Instant::now();
             } else if last_touch.elapsed() >= idle_timeout && is_screen_on() && !is_gpu_busy() {
                 if sf.set_mode(MODE_IDLE_60HZ) {
