@@ -64,9 +64,13 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
         }
     }
 
+    // Optional power-key device (e.g. pmic_pwrkey) for instant wake-from-screen-off detection.
+    let mut pwrkey_file = find_pwrkey_path().and_then(|p| open_nonblock(&p));
+
     crate::klog(&format!(
-        "idle-fps active: touch={} timeout={}ms",
+        "idle-fps active: touch={} pwrkey={} timeout={}ms",
         touch_path.display(),
+        pwrkey_file.is_some(),
         idle_timeout.as_millis()
     ));
 
@@ -83,20 +87,24 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
         if now.duration_since(last_state_check) >= Duration::from_secs(2) {
             last_state_check = now;
             if !is_screen_on() {
-                // Never run dynamic refresh rate or call SurfaceFlinger while screen is off.
+                // Screen is off: never call SurfaceFlinger. Block in poll() on power key
+                // (up to 5s) for instant wake detection with near-zero CPU wakeups.
                 was_screen_on = false;
-                thread::sleep(Duration::from_secs(2));
+                wait_while_screen_off(pwrkey_file.as_mut(), &mut drain_buf, shutdown);
+                last_state_check = Instant::now() - Duration::from_secs(10);
                 continue;
             }
 
-            // Screen just transitioned OFF -> ON: drain stale touch events, let HWC settle,
-            // and unconditionally restore 120Hz (unless user selected Standard 60Hz).
+            // Screen just transitioned OFF -> ON: drain stale events and restore 120Hz immediately.
             if !was_screen_on {
                 was_screen_on = true;
                 in_idle_60 = false;
-                drain_touch(&mut touch_file, &mut drain_buf);
+                drain_fd(&mut touch_file, &mut drain_buf);
+                if let Some(f) = pwrkey_file.as_mut() {
+                    drain_fd(f, &mut drain_buf);
+                }
                 if !settings.is_standard_60_only() {
-                    thread::sleep(Duration::from_millis(250));
+                    thread::sleep(Duration::from_millis(120));
                     if is_screen_on() && sf.set_mode(MODE_ACTIVE_120HZ) {
                         let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
                     }
@@ -127,10 +135,11 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
             };
             let rc = unsafe { libc::poll(&mut pfd, 1, 2000) };
             if rc > 0 && (pfd.revents & libc::POLLIN) != 0 {
-                drain_touch(&mut touch_file, &mut drain_buf);
+                drain_fd(&mut touch_file, &mut drain_buf);
                 // Ignore AOD/FOD touches while screen is off.
                 if !is_screen_on() {
                     was_screen_on = false;
+                    last_state_check = Instant::now() - Duration::from_secs(10);
                     continue;
                 }
                 last_touch = Instant::now();
@@ -143,7 +152,7 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
             // At 120Hz: never wake at 240Hz during scrolling — sleep 500ms, then drain any
             // accumulated touch events in a single non-blocking read.
             thread::sleep(Duration::from_millis(500));
-            if drain_touch(&mut touch_file, &mut drain_buf) {
+            if drain_fd(&mut touch_file, &mut drain_buf) {
                 last_touch = Instant::now();
             } else if last_touch.elapsed() >= idle_timeout && is_screen_on() && !is_gpu_busy() {
                 if sf.set_mode(MODE_IDLE_60HZ) {
@@ -159,7 +168,43 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
     }
 }
 
-fn drain_touch(file: &mut File, buf: &mut [u8]) -> bool {
+fn open_nonblock(path: &Path) -> Option<File> {
+    let file = File::open(path).ok()?;
+    let fd = file.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    Some(file)
+}
+
+fn wait_while_screen_off(pwrkey: Option<&mut File>, buf: &mut [u8], shutdown: &AtomicBool) {
+    if let Some(file) = pwrkey {
+        let mut pfd = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 5000) };
+        if rc > 0 && (pfd.revents & libc::POLLIN) != 0 {
+            drain_fd(file, buf);
+            // Power key pressed: wait briefly (up to 400ms) for screen_state -> 1 so
+            // the main loop immediately restores 120Hz on the wake transition.
+            for _ in 0..8 {
+                if shutdown.load(Ordering::Relaxed) || is_screen_on() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    } else {
+        thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn drain_fd(file: &mut File, buf: &mut [u8]) -> bool {
     let mut saw_event = false;
     while let Ok(n) = file.read(buf) {
         if n == 0 {
@@ -168,6 +213,38 @@ fn drain_touch(file: &mut File, buf: &mut [u8]) -> bool {
         saw_event = true;
     }
     saw_event
+}
+
+fn find_pwrkey_path() -> Option<PathBuf> {
+    let text = fs::read_to_string(INPUT_DEVICES_PATH).ok()?;
+    let event = find_pwrkey_event(&text)?;
+    let path = PathBuf::from("/dev/input").join(event);
+    path.exists().then_some(path)
+}
+
+fn find_pwrkey_event(proc_devices: &str) -> Option<String> {
+    for block in proc_devices.split("\n\n") {
+        let mut is_pwrkey = false;
+        let mut event_name: Option<String> = None;
+        for line in block.lines() {
+            if let Some(name) = line.strip_prefix("N: Name=") {
+                let lower = name.to_ascii_lowercase();
+                if lower.contains("pwrkey") && !lower.contains("bark") && !lower.contains("resin") {
+                    is_pwrkey = true;
+                }
+            } else if let Some(handlers) = line.strip_prefix("H: Handlers=") {
+                for token in handlers.split_whitespace() {
+                    if token.starts_with("event") {
+                        event_name = Some(token.to_owned());
+                    }
+                }
+            }
+        }
+        if is_pwrkey && event_name.is_some() {
+            return event_name;
+        }
+    }
+    None
 }
 
 fn wait_for_touch_device(shutdown: &AtomicBool) -> Option<PathBuf> {
@@ -379,5 +456,17 @@ B: EV=b
         assert_eq!(parse_gpu_busy_pct(" 302647 1004619\n"), Some(30));
         assert_eq!(parse_gpu_busy_pct(" 12000 1000000\n"), Some(1));
         assert_eq!(parse_gpu_busy_pct(" 0 0\n"), Some(0));
+    }
+
+    #[test]
+    fn finds_pmic_pwrkey_event() {
+        let sample = "\
+N: Name=\"pmic_pwrkey\"
+H: Handlers=event2 cpufreq xiaomitouch
+
+N: Name=\"pmic_pwrkey_bark\"
+H: Handlers=event5 cpufreq xiaomitouch
+";
+        assert_eq!(find_pwrkey_event(sample).as_deref(), Some("event2"));
     }
 }
