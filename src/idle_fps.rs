@@ -73,7 +73,6 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
     let mut sf = SurfaceFlingerClient::default();
     let mut settings = DisplaySettingsCache::new();
     let mut in_idle_60 = false;
-    let mut needs_restore_120 = false;
     let mut was_screen_on = is_screen_on();
     let mut last_touch = Instant::now();
     let mut last_state_check = Instant::now() - Duration::from_secs(10);
@@ -83,42 +82,33 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
         let now = Instant::now();
         if now.duration_since(last_state_check) >= Duration::from_secs(2) {
             last_state_check = now;
-            let screen_on = is_screen_on();
-            if !screen_on {
-                if in_idle_60 && sf.set_mode(MODE_RELEASE_OVERRIDE) {
-                    in_idle_60 = false;
-                    // ColorOS SF stays at 60Hz after -1 until mode 1 is sent when screen is ON.
-                    needs_restore_120 = true;
-                }
+            if !is_screen_on() {
+                // Never run dynamic refresh rate or call SurfaceFlinger while screen is off.
                 was_screen_on = false;
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
 
-            // Screen just transitioned OFF -> ON: drain stale touch events, let HWC settle briefly,
-            // and restore 120Hz if we had dropped to 60Hz before screen-off.
+            // Screen just transitioned OFF -> ON: drain stale touch events, let HWC settle,
+            // and unconditionally restore 120Hz (unless user selected Standard 60Hz).
             if !was_screen_on {
                 was_screen_on = true;
                 in_idle_60 = false;
                 drain_touch(&mut touch_file, &mut drain_buf);
-                if needs_restore_120 && settings.should_idle_drop() {
+                if !settings.is_standard_60_only() {
                     thread::sleep(Duration::from_millis(250));
-                    if sf.set_mode(MODE_ACTIVE_120HZ) {
+                    if is_screen_on() && sf.set_mode(MODE_ACTIVE_120HZ) {
                         let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
-                        needs_restore_120 = false;
                     }
-                } else {
-                    needs_restore_120 = false;
                 }
                 last_touch = Instant::now();
             }
 
             if !settings.should_idle_drop() {
-                if in_idle_60 || needs_restore_120 {
+                if in_idle_60 && is_screen_on() {
                     let _ = sf.set_mode(MODE_ACTIVE_120HZ);
                     if sf.set_mode(MODE_RELEASE_OVERRIDE) {
                         in_idle_60 = false;
-                        needs_restore_120 = false;
                     }
                 }
                 thread::sleep(Duration::from_secs(2));
@@ -138,6 +128,11 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
             let rc = unsafe { libc::poll(&mut pfd, 1, 2000) };
             if rc > 0 && (pfd.revents & libc::POLLIN) != 0 {
                 drain_touch(&mut touch_file, &mut drain_buf);
+                // Ignore AOD/FOD touches while screen is off.
+                if !is_screen_on() {
+                    was_screen_on = false;
+                    continue;
+                }
                 last_touch = Instant::now();
                 if sf.set_mode(MODE_ACTIVE_120HZ) {
                     let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
@@ -150,7 +145,7 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
             thread::sleep(Duration::from_millis(500));
             if drain_touch(&mut touch_file, &mut drain_buf) {
                 last_touch = Instant::now();
-            } else if last_touch.elapsed() >= idle_timeout && !is_gpu_busy() {
+            } else if last_touch.elapsed() >= idle_timeout && is_screen_on() && !is_gpu_busy() {
                 if sf.set_mode(MODE_IDLE_60HZ) {
                     in_idle_60 = true;
                 }
@@ -158,7 +153,7 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
         }
     }
 
-    if in_idle_60 {
+    if in_idle_60 && is_screen_on() {
         let _ = sf.set_mode(MODE_ACTIVE_120HZ);
         let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
     }
@@ -319,7 +314,17 @@ impl DisplaySettingsCache {
         }
     }
 
+    fn is_standard_60_only(&mut self) -> bool {
+        self.refresh();
+        self.standard_60_only
+    }
+
     fn should_idle_drop(&mut self) -> bool {
+        self.refresh();
+        !self.high_perf && !self.standard_60_only
+    }
+
+    fn refresh(&mut self) {
         if let Ok(mtime) = fs::metadata(&self.system_xml).and_then(|m| m.modified()) {
             if self.last_system_mtime != Some(mtime) {
                 self.last_system_mtime = Some(mtime);
@@ -344,8 +349,6 @@ impl DisplaySettingsCache {
                 }
             }
         }
-
-        !self.high_perf && !self.standard_60_only
     }
 }
 
