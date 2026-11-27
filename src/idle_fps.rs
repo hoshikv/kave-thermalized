@@ -73,6 +73,7 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
     let mut sf = SurfaceFlingerClient::default();
     let mut settings = DisplaySettingsCache::new();
     let mut in_idle_60 = false;
+    let mut needs_restore_120 = false;
     let mut was_screen_on = is_screen_on();
     let mut last_touch = Instant::now();
     let mut last_state_check = Instant::now() - Duration::from_secs(10);
@@ -86,26 +87,38 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
             if !screen_on {
                 if in_idle_60 && sf.set_mode(MODE_RELEASE_OVERRIDE) {
                     in_idle_60 = false;
+                    // ColorOS SF stays at 60Hz after -1 until mode 1 is sent when screen is ON.
+                    needs_restore_120 = true;
                 }
                 was_screen_on = false;
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
 
-            // Screen just transitioned OFF -> ON: drain stale touch events and give HWC/unlock a
-            // full idle_timeout grace period without issuing any modeset calls.
+            // Screen just transitioned OFF -> ON: drain stale touch events, let HWC settle briefly,
+            // and restore 120Hz if we had dropped to 60Hz before screen-off.
             if !was_screen_on {
                 was_screen_on = true;
                 in_idle_60 = false;
                 drain_touch(&mut touch_file, &mut drain_buf);
+                if needs_restore_120 && settings.should_idle_drop() {
+                    thread::sleep(Duration::from_millis(250));
+                    if sf.set_mode(MODE_ACTIVE_120HZ) {
+                        let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
+                        needs_restore_120 = false;
+                    }
+                } else {
+                    needs_restore_120 = false;
+                }
                 last_touch = Instant::now();
             }
 
             if !settings.should_idle_drop() {
-                if in_idle_60 {
+                if in_idle_60 || needs_restore_120 {
                     let _ = sf.set_mode(MODE_ACTIVE_120HZ);
                     if sf.set_mode(MODE_RELEASE_OVERRIDE) {
                         in_idle_60 = false;
+                        needs_restore_120 = false;
                     }
                 }
                 thread::sleep(Duration::from_secs(2));
