@@ -141,6 +141,14 @@ fn watch(args: Options, runtime: Runtime, stop: Arc<AtomicBool>) -> Result<(), S
         return Ok(());
     }
 
+    if !args.dry_run && read_i64(&sconfig).unwrap_or(-1) < 0 {
+        if let Err(err) = fs::write(&sconfig, b"0\n") {
+            crate::klog(&format!("failed to initialize sconfig=0: {err}"));
+        } else {
+            crate::klog("initialized sconfig=0 (was -1)");
+        }
+    }
+
     let region_map = region_map_path(&args);
     let mut last = read_i64(&sconfig).unwrap_or(-1);
     while !stop.load(Ordering::Relaxed) {
