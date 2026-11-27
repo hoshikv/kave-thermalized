@@ -547,7 +547,7 @@ impl ColorOsModeWatcher {
 
 /// Extract a setting's string value from an Android Binary XML (ABX) settings file.
 /// Layout: [u16_be key_len][key bytes] [0x2f (ATTR_STRING)] [u16_be intern_id | 0xffff u16_be len name] [u16_be val_len][val bytes]
-fn abx_setting_value(data: &[u8], key: &str) -> Option<String> {
+pub(crate) fn abx_setting_value(data: &[u8], key: &str) -> Option<String> {
     let key_bytes = key.as_bytes();
     let key_len = u16::try_from(key_bytes.len()).ok()?;
     let mut needle = Vec::with_capacity(2 + key_bytes.len());

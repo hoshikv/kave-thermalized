@@ -3,6 +3,7 @@ mod config;
 mod crypto;
 mod devices;
 mod hal;
+mod idle_fps;
 mod mi_thermald;
 mod sensors;
 mod sysfs;
@@ -201,6 +202,8 @@ fn main() {
             None
         }
     };
+
+    idle_fps::spawn(&SHUTDOWN);
 
     while !SHUTDOWN.load(Ordering::SeqCst) {
         publish(&shared, &mut sensors_set, &mut publish_cache);

@@ -18,6 +18,7 @@ Replaces both `android.hardware.thermal-service.qti` and stock `/vendor/bin/mi_t
   - **High Performance / GT Mode** (`high_performance_mode_on=1` or `gt_mode_state_setting=1`) → `sconfig = 50` (`thermal-per-normal.conf`)
   - Manual `sconfig` overrides (e.g. `echo 20 > sconfig`) are preserved until the user switches modes in Settings.
 - **Late-Registering Sensor Recovery**: Lazily re-probes thermal zones (`battery`, `/sys/class/power_supply/battery/temp`, etc.) and cooling devices every 5 s if they were not ready during early boot, and normalizes decidegree battery readings (`375` → `37500` m°C).
+- **Dynamic Idle 60 Hz (No OPlus VRR)**: Dedicated `idle-fps` thread polls the touchscreen `/dev/input/eventX` via `poll()` (0% CPU at rest) and switches SurfaceFlinger directly over Binder (`ISurfaceComposer` transaction `1035`, `group=0` seamless): drops to **60 Hz** after 3 s without touch, wakes to **120 Hz** in `<1 ms` on touch, and auto-releases override when screen is off/AOD, Standard 60 Hz is selected, or High Performance / GT mode is active. Configurable via `HOSHIKV_IDLE_FPS=0` or `HOSHIKV_IDLE_FPS_MS`.
 - **Stock `VIRTUAL-SENSOR0` Skin Model**: Computes virtual skin temperature using stock `peridot` weights (`cpu=-26`, `batt=301`, `chg=147`, `wifi=330`, `pa0=36`, `pa1=119`, `quiet=-2`, `weight_sum=1000`, `compensation=2015`).
 
 ---
@@ -121,6 +122,7 @@ Writing a scene ID to `/sys/class/thermal/thermal_message/sconfig` switches both
 ├── src/
 │   ├── main.rs                     # Process entry, binder thread, 1s HAL tick
 │   ├── hal.rs                      # IThermal AIDL service, thresholds, callbacks
+│   ├── idle_fps.rs                 # Touch-driven 120 Hz <-> 60 Hz idle dropper via SurfaceFlinger Binder
 │   ├── sensors.rs                  # HAL sensor probing, lazy re-probe, VIRTUAL-SENSOR0
 │   ├── sysfs.rs                    # Cached sysfs & cooling-device helpers
 │   ├── mi_thermald.rs              # Policy loader, sconfig watcher, ColorOS ABX mode sync
