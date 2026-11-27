@@ -75,85 +75,71 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
     let mut in_idle_60 = false;
     let mut was_screen_on = is_screen_on();
     let mut last_touch = Instant::now();
+    let mut last_state_check = Instant::now() - Duration::from_secs(10);
     let mut drain_buf = [0u8; 512];
 
     while !shutdown.load(Ordering::Relaxed) {
-        let screen_on = is_screen_on();
-        if !screen_on {
-            if in_idle_60 {
-                // Only release override on screen-off; never force 120Hz while display is powering down.
-                if sf.set_mode(MODE_RELEASE_OVERRIDE) {
+        let now = Instant::now();
+        if now.duration_since(last_state_check) >= Duration::from_secs(2) {
+            last_state_check = now;
+            let screen_on = is_screen_on();
+            if !screen_on {
+                if in_idle_60 && sf.set_mode(MODE_RELEASE_OVERRIDE) {
                     in_idle_60 = false;
                 }
+                was_screen_on = false;
+                thread::sleep(Duration::from_secs(2));
+                continue;
             }
-            was_screen_on = false;
-            thread::sleep(Duration::from_millis(500));
-            continue;
-        }
 
-        // Screen just transitioned OFF -> ON: drain stale touch events and give HWC/unlock a clean
-        // full idle_timeout grace period without issuing any modeset calls.
-        if !was_screen_on {
-            was_screen_on = true;
-            in_idle_60 = false;
-            while let Ok(n) = touch_file.read(&mut drain_buf) {
-                if n == 0 {
-                    break;
-                }
+            // Screen just transitioned OFF -> ON: drain stale touch events and give HWC/unlock a
+            // full idle_timeout grace period without issuing any modeset calls.
+            if !was_screen_on {
+                was_screen_on = true;
+                in_idle_60 = false;
+                drain_touch(&mut touch_file, &mut drain_buf);
+                last_touch = Instant::now();
             }
-            last_touch = Instant::now();
-        }
 
-        if !settings.should_idle_drop() {
-            if in_idle_60 {
-                let _ = sf.set_mode(MODE_ACTIVE_120HZ);
-                if sf.set_mode(MODE_RELEASE_OVERRIDE) {
-                    in_idle_60 = false;
-                }
-            }
-            thread::sleep(Duration::from_millis(500));
-            last_touch = Instant::now();
-            continue;
-        }
-
-        let poll_ms: i32 = if in_idle_60 {
-            1000
-        } else {
-            let elapsed = last_touch.elapsed();
-            if elapsed >= idle_timeout {
-                if is_gpu_busy() {
-                    // Active animation / game cutscene: stay at 120Hz and re-check in 1s.
-                    1000
-                } else {
-                    if sf.set_mode(MODE_IDLE_60HZ) {
-                        in_idle_60 = true;
+            if !settings.should_idle_drop() {
+                if in_idle_60 {
+                    let _ = sf.set_mode(MODE_ACTIVE_120HZ);
+                    if sf.set_mode(MODE_RELEASE_OVERRIDE) {
+                        in_idle_60 = false;
                     }
-                    1000
                 }
-            } else {
-                let remaining = idle_timeout.saturating_sub(elapsed);
-                remaining.as_millis().clamp(50, 500) as i32
+                thread::sleep(Duration::from_secs(2));
+                last_touch = Instant::now();
+                continue;
             }
-        };
+        }
 
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, poll_ms) };
-        if rc > 0 && (pfd.revents & libc::POLLIN) != 0 {
-            // Drain all pending input_event packets.
-            while let Ok(n) = touch_file.read(&mut drain_buf) {
-                if n == 0 {
-                    break;
-                }
-            }
-            last_touch = Instant::now();
-            if in_idle_60 {
+        if in_idle_60 {
+            // At 60Hz: block in kernel poll() for instant (<1ms) wake on first touch,
+            // waking at most once every 2s to re-check screen_state/settings.
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 2000) };
+            if rc > 0 && (pfd.revents & libc::POLLIN) != 0 {
+                drain_touch(&mut touch_file, &mut drain_buf);
+                last_touch = Instant::now();
                 if sf.set_mode(MODE_ACTIVE_120HZ) {
                     let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
                     in_idle_60 = false;
+                }
+            }
+        } else {
+            // At 120Hz: never wake at 240Hz during scrolling — sleep 500ms, then drain any
+            // accumulated touch events in a single non-blocking read.
+            thread::sleep(Duration::from_millis(500));
+            if drain_touch(&mut touch_file, &mut drain_buf) {
+                last_touch = Instant::now();
+            } else if last_touch.elapsed() >= idle_timeout && !is_gpu_busy() {
+                if sf.set_mode(MODE_IDLE_60HZ) {
+                    in_idle_60 = true;
                 }
             }
         }
@@ -163,6 +149,17 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
         let _ = sf.set_mode(MODE_ACTIVE_120HZ);
         let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
     }
+}
+
+fn drain_touch(file: &mut File, buf: &mut [u8]) -> bool {
+    let mut saw_event = false;
+    while let Ok(n) = file.read(buf) {
+        if n == 0 {
+            break;
+        }
+        saw_event = true;
+    }
+    saw_event
 }
 
 fn wait_for_touch_device(shutdown: &AtomicBool) -> Option<PathBuf> {
