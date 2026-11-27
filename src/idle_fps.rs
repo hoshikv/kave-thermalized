@@ -1,7 +1,7 @@
-use crate::mi_thermald::abx_setting_value;
+use crate::mi_thermald::{abx_setting_value, drain_inotify, open_settings_inotify};
 use std::fs::{self, File};
 use std::io::Read;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -373,17 +373,32 @@ impl SurfaceFlingerClient {
 struct DisplaySettingsCache {
     system_xml: PathBuf,
     secure_xml: PathBuf,
+    inotify_fd: Option<RawFd>,
+    initialized: bool,
     last_system_mtime: Option<SystemTime>,
     last_secure_mtime: Option<SystemTime>,
     high_perf: bool,
     standard_60_only: bool,
 }
 
+impl Drop for DisplaySettingsCache {
+    fn drop(&mut self) {
+        if let Some(fd) = self.inotify_fd.take() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
 impl DisplaySettingsCache {
     fn new() -> Self {
+        let dir = Path::new("/data/system/users/0");
         Self {
-            system_xml: Path::new("/data/system/users/0/settings_system.xml").to_path_buf(),
-            secure_xml: Path::new("/data/system/users/0/settings_secure.xml").to_path_buf(),
+            system_xml: dir.join("settings_system.xml"),
+            secure_xml: dir.join("settings_secure.xml"),
+            inotify_fd: open_settings_inotify(dir),
+            initialized: false,
             last_system_mtime: None,
             last_secure_mtime: None,
             high_perf: false,
@@ -402,6 +417,14 @@ impl DisplaySettingsCache {
     }
 
     fn refresh(&mut self) {
+        if self.initialized {
+            if let Some(fd) = self.inotify_fd {
+                if !drain_inotify(fd) {
+                    return;
+                }
+            }
+        }
+        self.initialized = true;
         if let Ok(mtime) = fs::metadata(&self.system_xml).and_then(|m| m.modified()) {
             if self.last_system_mtime != Some(mtime) {
                 self.last_system_mtime = Some(mtime);

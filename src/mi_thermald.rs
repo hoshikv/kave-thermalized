@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -470,6 +471,7 @@ impl ColorOsPowerMode {
 struct ColorOsModeWatcher {
     system_xml: PathBuf,
     global_xml: PathBuf,
+    inotify_fd: Option<RawFd>,
     last_system_mtime: Option<SystemTime>,
     last_global_mtime: Option<SystemTime>,
     high_perf: bool,
@@ -477,11 +479,24 @@ struct ColorOsModeWatcher {
     last_mode: Option<ColorOsPowerMode>,
 }
 
+impl Drop for ColorOsModeWatcher {
+    fn drop(&mut self) {
+        if let Some(fd) = self.inotify_fd.take() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
 impl ColorOsModeWatcher {
     fn new(root: &Path) -> Self {
+        let dir = root.join("data/system/users/0");
+        let inotify_fd = open_settings_inotify(&dir);
         Self {
-            system_xml: root.join("data/system/users/0/settings_system.xml"),
-            global_xml: root.join("data/system/users/0/settings_global.xml"),
+            system_xml: dir.join("settings_system.xml"),
+            global_xml: dir.join("settings_global.xml"),
+            inotify_fd,
             last_system_mtime: None,
             last_global_mtime: None,
             high_perf: false,
@@ -491,7 +506,17 @@ impl ColorOsModeWatcher {
     }
 
     /// Returns `Some(mode)` only when ColorOS power/performance mode changes.
+    /// Uses inotify so steady-state polling performs zero `stat()` calls.
     fn poll(&mut self) -> Option<ColorOsPowerMode> {
+        let initial = self.last_mode.is_none();
+        if !initial {
+            if let Some(fd) = self.inotify_fd {
+                if !drain_inotify(fd) {
+                    return None;
+                }
+            }
+        }
+
         let mut changed = false;
 
         if let Ok(mtime) = fs::metadata(&self.system_xml).and_then(|m| m.modified()) {
@@ -543,6 +568,41 @@ impl ColorOsModeWatcher {
             Some(mode)
         }
     }
+}
+
+pub(crate) fn open_settings_inotify(dir: &Path) -> Option<RawFd> {
+    let c_dir = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let wd = unsafe {
+        libc::inotify_add_watch(
+            fd,
+            c_dir.as_ptr(),
+            libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE,
+        )
+    };
+    if wd < 0 {
+        unsafe {
+            libc::close(fd);
+        }
+        return None;
+    }
+    Some(fd)
+}
+
+pub(crate) fn drain_inotify(fd: RawFd) -> bool {
+    let mut buf = [0u8; 512];
+    let mut saw_event = false;
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        saw_event = true;
+    }
+    saw_event
 }
 
 /// Extract a setting's string value from an Android Binary XML (ABX) settings file.
