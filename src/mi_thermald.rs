@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::algos::{self, Algo};
 use crate::config::{load_text, parse_devices, parse_region_map, parse_thermal, parse_thermal_map};
@@ -141,11 +141,23 @@ fn watch(args: Options, runtime: Runtime, stop: Arc<AtomicBool>) -> Result<(), S
         return Ok(());
     }
 
-    if !args.dry_run && read_i64(&sconfig).unwrap_or(-1) < 0 {
-        if let Err(err) = fs::write(&sconfig, b"0\n") {
-            crate::klog(&format!("failed to initialize sconfig=0: {err}"));
-        } else {
-            crate::klog("initialized sconfig=0 (was -1)");
+    let mut mode_watcher = ColorOsModeWatcher::new(&args.sysfs_root);
+    let initial_mode = mode_watcher.poll();
+    if !args.dry_run {
+        let current = read_i64(&sconfig).unwrap_or(-1);
+        let desired = match initial_mode {
+            Some(mode) => Some(mode.sconfig()),
+            None if current < 0 => Some(0),
+            None => None,
+        };
+        if let Some(target) = desired {
+            if current != target {
+                if let Err(err) = fs::write(&sconfig, format!("{target}\n")) {
+                    crate::klog(&format!("failed to initialize sconfig={target}: {err}"));
+                } else {
+                    crate::klog(&format!("initialized sconfig={target} (was {current})"));
+                }
+            }
         }
     }
 
@@ -155,6 +167,18 @@ fn watch(args: Options, runtime: Runtime, stop: Arc<AtomicBool>) -> Result<(), S
         thread::sleep(Duration::from_millis(500));
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+        if !args.dry_run {
+            if let Some(mode) = mode_watcher.poll() {
+                let target = mode.sconfig();
+                if read_i64(&sconfig) != Some(target) {
+                    if let Err(err) = fs::write(&sconfig, format!("{target}\n")) {
+                        crate::klog(&format!("coloros mode {:?} -> sconfig={target} failed: {err}", mode));
+                    } else {
+                        crate::klog(&format!("coloros mode {:?} -> sconfig={target}", mode));
+                    }
+                }
+            }
         }
         let Some(value) = read_i64(&sconfig) else {
             continue;
@@ -423,5 +447,161 @@ fn default_config_dir() -> PathBuf {
         PathBuf::from("/vendor/etc")
     } else {
         PathBuf::from("/odm/etc")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorOsPowerMode {
+    PowerSaving,
+    Balanced,
+    HighPerformance,
+}
+
+impl ColorOsPowerMode {
+    fn sconfig(self) -> i64 {
+        match self {
+            Self::PowerSaving => 5,      // thermal-phone.conf
+            Self::Balanced => 0,         // thermal-normal.conf
+            Self::HighPerformance => 50, // thermal-per-normal.conf
+        }
+    }
+}
+
+struct ColorOsModeWatcher {
+    system_xml: PathBuf,
+    global_xml: PathBuf,
+    last_system_mtime: Option<SystemTime>,
+    last_global_mtime: Option<SystemTime>,
+    high_perf: bool,
+    low_power: bool,
+    last_mode: Option<ColorOsPowerMode>,
+}
+
+impl ColorOsModeWatcher {
+    fn new(root: &Path) -> Self {
+        Self {
+            system_xml: root.join("data/system/users/0/settings_system.xml"),
+            global_xml: root.join("data/system/users/0/settings_global.xml"),
+            last_system_mtime: None,
+            last_global_mtime: None,
+            high_perf: false,
+            low_power: false,
+            last_mode: None,
+        }
+    }
+
+    /// Returns `Some(mode)` only when ColorOS power/performance mode changes.
+    fn poll(&mut self) -> Option<ColorOsPowerMode> {
+        let mut changed = false;
+
+        if let Ok(mtime) = fs::metadata(&self.system_xml).and_then(|m| m.modified()) {
+            if self.last_system_mtime != Some(mtime) {
+                self.last_system_mtime = Some(mtime);
+                if let Ok(bytes) = fs::read(&self.system_xml) {
+                    let hp = abx_setting_value(&bytes, "high_performance_mode_on")
+                        .as_deref()
+                        == Some("1");
+                    let gt = abx_setting_value(&bytes, "gt_mode_state_setting")
+                        .as_deref()
+                        == Some("1");
+                    self.high_perf = hp || gt;
+                    changed = true;
+                }
+            }
+        }
+
+        if let Ok(mtime) = fs::metadata(&self.global_xml).and_then(|m| m.modified()) {
+            if self.last_global_mtime != Some(mtime) {
+                self.last_global_mtime = Some(mtime);
+                if let Ok(bytes) = fs::read(&self.global_xml) {
+                    self.low_power =
+                        abx_setting_value(&bytes, "low_power").as_deref() == Some("1");
+                    changed = true;
+                }
+            }
+        }
+
+        if !changed && self.last_mode.is_some() {
+            return None;
+        }
+        if self.last_system_mtime.is_none() && self.last_global_mtime.is_none() {
+            return None;
+        }
+
+        let mode = if self.low_power {
+            ColorOsPowerMode::PowerSaving
+        } else if self.high_perf {
+            ColorOsPowerMode::HighPerformance
+        } else {
+            ColorOsPowerMode::Balanced
+        };
+
+        if self.last_mode == Some(mode) {
+            None
+        } else {
+            self.last_mode = Some(mode);
+            Some(mode)
+        }
+    }
+}
+
+/// Extract a setting's string value from an Android Binary XML (ABX) settings file.
+/// Layout: [u16_be key_len][key bytes] [0x2f (ATTR_STRING)] [u16_be intern_id | 0xffff u16_be len name] [u16_be val_len][val bytes]
+fn abx_setting_value(data: &[u8], key: &str) -> Option<String> {
+    let key_bytes = key.as_bytes();
+    let key_len = u16::try_from(key_bytes.len()).ok()?;
+    let mut needle = Vec::with_capacity(2 + key_bytes.len());
+    needle.extend_from_slice(&key_len.to_be_bytes());
+    needle.extend_from_slice(key_bytes);
+
+    let mut offset = 0;
+    while offset + needle.len() <= data.len() {
+        let rel = data[offset..]
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())?;
+        let after = offset + rel + needle.len();
+        if after < data.len() && data[after] == 0x2f {
+            let mut pos = after + 1;
+            if pos + 2 <= data.len() {
+                let id = u16::from_be_bytes([data[pos], data[pos + 1]]);
+                pos += 2;
+                if id == 0xffff {
+                    if pos + 2 > data.len() {
+                        return None;
+                    }
+                    let name_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                    pos += 2 + name_len;
+                }
+                if pos + 2 <= data.len() {
+                    let val_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                    pos += 2;
+                    if pos + val_len <= data.len() {
+                        return String::from_utf8(data[pos..pos + val_len].to_vec()).ok();
+                    }
+                }
+            }
+        }
+        offset = after;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_abx_setting_value() {
+        // Real ABX slice from peridot settings_system.xml: high_performance_mode_on = "1"
+        let sample: &[u8] = &[
+            0x2f, 0x00, 0x04, 0x00, 0x18, b'h', b'i', b'g', b'h', b'_', b'p', b'e', b'r', b'f',
+            b'o', b'r', b'm', b'a', b'n', b'c', b'e', b'_', b'm', b'o', b'd', b'e', b'_', b'o',
+            b'n', 0x2f, 0x00, 0x05, 0x00, 0x01, b'1', 0x2f, 0x00, 0x06,
+        ];
+        assert_eq!(
+            abx_setting_value(sample, "high_performance_mode_on").as_deref(),
+            Some("1")
+        );
+        assert_eq!(abx_setting_value(sample, "low_power"), None);
     }
 }
