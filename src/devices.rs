@@ -397,8 +397,8 @@ const SCREEN_STATE_PATH: &str = "/sys/class/thermal/thermal_message/screen_state
 const BATTERY_SAFETY_TEMP_DECIC: i32 = 445; // 44.5 C safety ceiling (screen off / gaming)
 const BALANCED_SCREEN_ON_CHG_TEMP_DECIC: i32 = 395; // 39.5 C cool charging ceiling when screen ON in Balanced
 const BALANCED_COOL_TEMP_DECIC: i32 = 410; // 41.0 C smooth ceiling for Balanced CPU floor
-const CPU3_SMOOTH_FLOOR_KHZ: i64 = 2_188_800; // 2.18 GHz Gold floor below 41.0C for jank-free UI
-const CPU7_SMOOTH_FLOOR_KHZ: i64 = 2_304_000; // 2.30 GHz Prime floor below 41.0C for jank-free UI
+const CPU3_SMOOTH_FLOOR_KHZ: i64 = 2_572_800; // 2.57 GHz Gold floor below 41.0C (matches non-janky b88dc9a)
+const CPU7_SMOOTH_FLOOR_KHZ: i64 = 2_668_800; // 2.66 GHz Prime floor below 41.0C (matches non-janky b88dc9a)
 
 fn read_battery_temp_decic() -> Option<i32> {
     fs::read_to_string(BATTERY_TEMP_PATH)
