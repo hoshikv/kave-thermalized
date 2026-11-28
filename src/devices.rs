@@ -210,7 +210,11 @@ impl DeviceStore {
                 chosen = chosen.max(limit);
             }
         }
-        let effective = chosen;
+        let effective = if dry_run {
+            chosen
+        } else {
+            apply_ui_smooth_cpu_floor(name, chosen)
+        };
         let applied = self.apply_battery_scale(name, effective);
         // Respect Kave Cosmic Charging Control Speed override while battery temp < 45.0C
         // (prevents both WiredTherma and SIC from fighting 18W/33W/MAX; safety guard resumes at >=45C).
@@ -388,7 +392,42 @@ fn read_cpu_levels(root: &Path, name: &str) -> Vec<i64> {
 
 const COSMIC_CHARGING_OVERRIDE: &str = "/data/vendor/kave_cosmic/charging_override";
 const BATTERY_TEMP_PATH: &str = "/sys/class/power_supply/battery/temp";
+const SCONFIG_PATH: &str = "/sys/class/thermal/thermal_message/sconfig";
 const BATTERY_SAFETY_TEMP_DECIC: i32 = 450; // 45.0 C safety ceiling
+const CPU3_SMOOTH_FLOOR_KHZ: i64 = 1_920_000; // 1.92 GHz Gold floor for smooth 120Hz ColorOS UI
+const CPU7_SMOOTH_FLOOR_KHZ: i64 = 2_150_400; // 2.15 GHz Prime floor for smooth 120Hz ColorOS UI
+
+fn read_battery_temp_decic() -> Option<i32> {
+    fs::read_to_string(BATTERY_TEMP_PATH)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+}
+
+fn apply_ui_smooth_cpu_floor(name: &str, freq_khz: i64) -> i64 {
+    if freq_khz <= 0 {
+        return freq_khz;
+    }
+    let floor = match name {
+        "cpu3" => CPU3_SMOOTH_FLOOR_KHZ,
+        "cpu7" => CPU7_SMOOTH_FLOOR_KHZ,
+        _ => return freq_khz,
+    };
+    if freq_khz >= floor {
+        return freq_khz;
+    }
+    // Keep full throttling in Battery Saver (sconfig=5) or when battery >= 45.0C.
+    let sconfig = fs::read_to_string(SCONFIG_PATH)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(0);
+    if sconfig == 5 {
+        return freq_khz;
+    }
+    match read_battery_temp_decic() {
+        Some(t) if t < BATTERY_SAFETY_TEMP_DECIC => floor,
+        _ => freq_khz,
+    }
+}
 
 fn cosmic_charging_override_active() -> bool {
     let enabled = fs::read_to_string(COSMIC_CHARGING_OVERRIDE)
@@ -398,11 +437,7 @@ fn cosmic_charging_override_active() -> bool {
     if !enabled {
         return false;
     }
-    let temp = fs::read_to_string(BATTERY_TEMP_PATH)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .unwrap_or(0);
-    temp < BATTERY_SAFETY_TEMP_DECIC
+    read_battery_temp_decic().unwrap_or(0) < BATTERY_SAFETY_TEMP_DECIC
 }
 
 pub fn is_cpu_name(name: &str) -> bool {
