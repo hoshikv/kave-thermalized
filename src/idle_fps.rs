@@ -480,7 +480,7 @@ impl DisplaySettingsCache {
             last_cosmic_mtime: None,
             high_perf: false,
             standard_60_only: false,
-            cosmic_enabled: true,
+            cosmic_enabled: false,
             cosmic_timeout_ms: None,
             cosmic_locked_mode: None,
         }

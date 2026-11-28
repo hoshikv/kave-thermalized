@@ -482,10 +482,10 @@ enum ColorOsPowerMode {
 impl ColorOsPowerMode {
     fn sconfig(self) -> i64 {
         match self {
-            Self::PowerSaving => 5,      // thermal-phone.conf (42C)
-            Self::Balanced => 0,         // thermal-normal.conf (46C)
-            Self::HighPerformance => 20, // thermal-yuanshen.conf (48C, no early CPU throttle)
-            Self::ProGamer => 6,         // thermal-nolimits.conf (51C, full uncapped gaming)
+            Self::PowerSaving => 5,       // thermal-phone.conf (cool battery saver)
+            Self::Balanced => 0,          // thermal-normal.conf (cool 34-38C daily)
+            Self::HighPerformance => 501, // thermal-hp-mgame.conf (46C ceiling)
+            Self::ProGamer => 6,          // thermal-nolimits.conf (50-51C uncapped gaming)
         }
     }
 }

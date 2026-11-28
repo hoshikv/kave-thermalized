@@ -393,9 +393,12 @@ fn read_cpu_levels(root: &Path, name: &str) -> Vec<i64> {
 const COSMIC_CHARGING_OVERRIDE: &str = "/data/vendor/kave_cosmic/charging_override";
 const BATTERY_TEMP_PATH: &str = "/sys/class/power_supply/battery/temp";
 const SCONFIG_PATH: &str = "/sys/class/thermal/thermal_message/sconfig";
-const BATTERY_SAFETY_TEMP_DECIC: i32 = 450; // 45.0 C safety ceiling
-const CPU3_SMOOTH_FLOOR_KHZ: i64 = 1_920_000; // 1.92 GHz Gold floor for smooth 120Hz ColorOS UI
-const CPU7_SMOOTH_FLOOR_KHZ: i64 = 2_150_400; // 2.15 GHz Prime floor for smooth 120Hz ColorOS UI
+const SCREEN_STATE_PATH: &str = "/sys/class/thermal/thermal_message/screen_state";
+const BATTERY_SAFETY_TEMP_DECIC: i32 = 445; // 44.5 C safety ceiling (screen off / gaming)
+const BALANCED_SCREEN_ON_CHG_TEMP_DECIC: i32 = 395; // 39.5 C cool charging ceiling when screen ON in Balanced
+const BALANCED_COOL_TEMP_DECIC: i32 = 410; // 41.0 C smooth ceiling for Balanced CPU floor
+const CPU3_SMOOTH_FLOOR_KHZ: i64 = 2_188_800; // 2.18 GHz Gold floor below 41.0C for jank-free UI
+const CPU7_SMOOTH_FLOOR_KHZ: i64 = 2_304_000; // 2.30 GHz Prime floor below 41.0C for jank-free UI
 
 fn read_battery_temp_decic() -> Option<i32> {
     fs::read_to_string(BATTERY_TEMP_PATH)
@@ -403,7 +406,39 @@ fn read_battery_temp_decic() -> Option<i32> {
         .and_then(|s| s.trim().parse::<i32>().ok())
 }
 
+fn read_sconfig() -> i32 {
+    fs::read_to_string(SCONFIG_PATH)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
+fn is_screen_on_sysfs() -> bool {
+    fs::read_to_string(SCREEN_STATE_PATH)
+        .ok()
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
 fn apply_ui_smooth_cpu_floor(name: &str, freq_khz: i64) -> i64 {
+    if name == "gpu" {
+        if freq_khz <= 0 {
+            return freq_khz;
+        }
+        let sconfig = read_sconfig();
+        if sconfig == 5 {
+            return freq_khz;
+        }
+        let limit_decic = match sconfig {
+            0 | -1 => BALANCED_COOL_TEMP_DECIC,
+            501 => 460,
+            _ => BATTERY_SAFETY_TEMP_DECIC,
+        };
+        return match read_battery_temp_decic() {
+            Some(t) if t < limit_decic => 0,
+            _ => freq_khz,
+        };
+    }
     if freq_khz <= 0 {
         return freq_khz;
     }
@@ -415,16 +450,18 @@ fn apply_ui_smooth_cpu_floor(name: &str, freq_khz: i64) -> i64 {
     if freq_khz >= floor {
         return freq_khz;
     }
-    // Keep full throttling in Battery Saver (sconfig=5) or when battery >= 45.0C.
-    let sconfig = fs::read_to_string(SCONFIG_PATH)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .unwrap_or(0);
+    // Keep full throttling in Battery Saver (sconfig=5) or once Balanced exceeds 41.0C.
+    let sconfig = read_sconfig();
     if sconfig == 5 {
         return freq_khz;
     }
+    let limit_decic = match sconfig {
+        0 | -1 => BALANCED_COOL_TEMP_DECIC, // Balanced: 41.0C smooth ceiling
+        501 => 460,                         // Performance: 46.0C ceiling
+        _ => BATTERY_SAFETY_TEMP_DECIC,     // Pro Gamer / other
+    };
     match read_battery_temp_decic() {
-        Some(t) if t < BATTERY_SAFETY_TEMP_DECIC => floor,
+        Some(t) if t < limit_decic => floor,
         _ => freq_khz,
     }
 }
@@ -437,7 +474,12 @@ fn cosmic_charging_override_active() -> bool {
     if !enabled {
         return false;
     }
-    read_battery_temp_decic().unwrap_or(0) < BATTERY_SAFETY_TEMP_DECIC
+    let ceiling = if read_sconfig() == 0 && is_screen_on_sysfs() {
+        BALANCED_SCREEN_ON_CHG_TEMP_DECIC
+    } else {
+        BATTERY_SAFETY_TEMP_DECIC
+    };
+    read_battery_temp_decic().unwrap_or(0) < ceiling
 }
 
 pub fn is_cpu_name(name: &str) -> bool {
