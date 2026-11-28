@@ -16,11 +16,13 @@ const MODE_IDLE_60HZ: i32 = 0;
 const MODE_ACTIVE_120HZ: i32 = 1;
 const MODE_RELEASE_OVERRIDE: i32 = -1;
 
-const DEFAULT_IDLE_TIMEOUT_MS: u64 = 3000;
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 1500;
 const GPU_BUSY_THRESHOLD_PCT: u64 = 25;
 const SCREEN_STATE_PATH: &str = "/sys/class/thermal/thermal_message/screen_state";
 const GPU_BUSY_PATH: &str = "/sys/class/kgsl/kgsl-3d0/gpubusy";
 const INPUT_DEVICES_PATH: &str = "/proc/bus/input/devices";
+const COSMIC_CONF_DIR: &str = "/data/vendor/kave_cosmic";
+const COSMIC_IDLE_FPS_CONF: &str = "/data/vendor/kave_cosmic/idle_fps.conf";
 
 pub fn spawn(shutdown: &'static AtomicBool) {
     if matches!(
@@ -188,7 +190,10 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
                 .map_or(false, |f| drain_fd(f, &mut drain_buf));
             if saw_touch || saw_pwr {
                 last_touch = Instant::now();
-            } else if last_touch.elapsed() >= idle_timeout && is_screen_on() && !is_gpu_busy() {
+            } else if last_touch.elapsed() >= settings.effective_timeout(idle_timeout)
+                && is_screen_on()
+                && !is_gpu_busy()
+            {
                 if sf.set_mode(MODE_IDLE_60HZ) {
                     in_idle_60 = true;
                 }
@@ -408,16 +413,26 @@ struct DisplaySettingsCache {
     system_xml: PathBuf,
     secure_xml: PathBuf,
     inotify_fd: Option<RawFd>,
+    cosmic_inotify_fd: Option<RawFd>,
     initialized: bool,
     last_system_mtime: Option<SystemTime>,
     last_secure_mtime: Option<SystemTime>,
+    last_cosmic_mtime: Option<SystemTime>,
     high_perf: bool,
     standard_60_only: bool,
+    cosmic_enabled: bool,
+    cosmic_timeout_ms: Option<u64>,
+    cosmic_refresh_locked: bool,
 }
 
 impl Drop for DisplaySettingsCache {
     fn drop(&mut self) {
         if let Some(fd) = self.inotify_fd.take() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+        if let Some(fd) = self.cosmic_inotify_fd.take() {
             unsafe {
                 libc::close(fd);
             }
@@ -428,29 +443,81 @@ impl Drop for DisplaySettingsCache {
 impl DisplaySettingsCache {
     fn new() -> Self {
         let dir = Path::new("/data/system/users/0");
+        let cosmic_dir = Path::new(COSMIC_CONF_DIR);
         Self {
             system_xml: dir.join("settings_system.xml"),
             secure_xml: dir.join("settings_secure.xml"),
             inotify_fd: open_settings_inotify(dir),
+            cosmic_inotify_fd: open_settings_inotify(cosmic_dir),
             initialized: false,
             last_system_mtime: None,
             last_secure_mtime: None,
+            last_cosmic_mtime: None,
             high_perf: false,
             standard_60_only: false,
+            cosmic_enabled: true,
+            cosmic_timeout_ms: None,
+            cosmic_refresh_locked: false,
         }
+    }
+
+    fn effective_timeout(&self, default_timeout: Duration) -> Duration {
+        self.cosmic_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(default_timeout)
     }
 
     fn is_standard_60_only(&mut self) -> bool {
         self.refresh();
-        self.standard_60_only
+        self.standard_60_only || self.cosmic_refresh_locked
     }
 
     fn should_idle_drop(&mut self) -> bool {
         self.refresh();
-        !self.high_perf && !self.standard_60_only
+        self.cosmic_enabled
+            && !self.cosmic_refresh_locked
+            && !self.high_perf
+            && !self.standard_60_only
+    }
+
+    fn refresh_cosmic(&mut self) {
+        if self.cosmic_inotify_fd.is_none() && Path::new(COSMIC_CONF_DIR).exists() {
+            self.cosmic_inotify_fd = open_settings_inotify(Path::new(COSMIC_CONF_DIR));
+        }
+        if self.initialized {
+            if let Some(fd) = self.cosmic_inotify_fd {
+                if !drain_inotify(fd) {
+                    return;
+                }
+            }
+        }
+        let conf_path = Path::new(COSMIC_IDLE_FPS_CONF);
+        if let Ok(mtime) = fs::metadata(conf_path).and_then(|m| m.modified()) {
+            if self.last_cosmic_mtime != Some(mtime) {
+                self.last_cosmic_mtime = Some(mtime);
+                if let Ok(text) = fs::read_to_string(conf_path) {
+                    for line in text.lines() {
+                        if let Some((k, v)) = line.split_once('=') {
+                            match k.trim() {
+                                "enabled" => self.cosmic_enabled = v.trim() != "0",
+                                "timeout_ms" => {
+                                    self.cosmic_timeout_ms =
+                                        v.trim().parse::<u64>().ok().filter(|&ms| ms >= 500);
+                                }
+                                "refresh_rate" => {
+                                    self.cosmic_refresh_locked = v.trim() != "auto";
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn refresh(&mut self) {
+        self.refresh_cosmic();
         if self.initialized {
             if let Some(fd) = self.inotify_fd {
                 if !drain_inotify(fd) {

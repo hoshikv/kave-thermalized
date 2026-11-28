@@ -143,6 +143,7 @@ impl DeviceStore {
         }
     }
 
+    #[allow(dead_code)]
     pub fn copy_state_from(&self, old: &DeviceStore) {
         for (name, old_device) in &old.devices {
             let Some(new_device) = self.devices.get(name) else {
@@ -211,6 +212,17 @@ impl DeviceStore {
         }
         let effective = chosen;
         let applied = self.apply_battery_scale(name, effective);
+        // Respect Kave Cosmic Charging Control Speed override while battery temp < 45.0C
+        // (prevents both WiredTherma and SIC from fighting 18W/33W/MAX; safety guard resumes at >=45C).
+        let is_charging_device = name == "battery"
+            || name.contains("sic")
+            || device.path.as_deref().is_some_and(|p| {
+                let s = p.to_string_lossy();
+                s.contains("constant_charge_current") || s.contains("charge_control_limit")
+            });
+        if !dry_run && is_charging_device && cosmic_charging_override_active() {
+            return Ok(0);
+        }
         if device.last == Some(effective) && device.last_applied == Some(applied) {
             return Ok(applied);
         }
@@ -372,6 +384,25 @@ fn read_cpu_levels(root: &Path, name: &str) -> Vec<i64> {
     }
     levels.sort_unstable_by(|left, right| right.cmp(left));
     levels
+}
+
+const COSMIC_CHARGING_OVERRIDE: &str = "/data/vendor/kave_cosmic/charging_override";
+const BATTERY_TEMP_PATH: &str = "/sys/class/power_supply/battery/temp";
+const BATTERY_SAFETY_TEMP_DECIC: i32 = 450; // 45.0 C safety ceiling
+
+fn cosmic_charging_override_active() -> bool {
+    let enabled = fs::read_to_string(COSMIC_CHARGING_OVERRIDE)
+        .ok()
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+    if !enabled {
+        return false;
+    }
+    let temp = fs::read_to_string(BATTERY_TEMP_PATH)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(0);
+    temp < BATTERY_SAFETY_TEMP_DECIC
 }
 
 pub fn is_cpu_name(name: &str) -> bool {

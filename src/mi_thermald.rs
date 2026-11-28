@@ -120,7 +120,19 @@ struct Runtime {
     algos: Vec<Algo>,
 }
 
+fn reset_cpu_limits(sysfs_root: &Path) {
+    let path = sysfs_root.join("sys/class/thermal/thermal_message/cpu_limits");
+    if path.exists() {
+        for cpu in ["cpu0", "cpu3", "cpu7"] {
+            let _ = fs::write(&path, format!("{cpu} 2147483647"));
+        }
+    }
+}
+
 fn watch(args: Options, runtime: Runtime, stop: Arc<AtomicBool>) -> Result<(), String> {
+    if !args.dry_run {
+        reset_cpu_limits(&args.sysfs_root);
+    }
     let mut sensors = Arc::new(runtime.sensors);
     let mut devices = Arc::new(runtime.devices);
     let mut group = algos::start(
@@ -163,7 +175,9 @@ fn watch(args: Options, runtime: Runtime, stop: Arc<AtomicBool>) -> Result<(), S
     }
 
     let region_map = region_map_path(&args);
-    let mut last = read_i64(&sconfig).unwrap_or(-1);
+    // Startup loads the default config (sconfig=0); keep `last = 0` so any
+    // non-zero sconfig (e.g. 6=nolimits, 20=yuanshen, 5=phone) switches immediately.
+    let mut last: i64 = 0;
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(500));
         if stop.load(Ordering::Relaxed) {
@@ -202,6 +216,10 @@ fn watch(args: Options, runtime: Runtime, stop: Arc<AtomicBool>) -> Result<(), S
         match resolved {
             Ok(Some(path)) => match build_runtime(&args, &path) {
                 Ok(runtime) => {
+                    crate::klog(&format!(
+                        "switched thermal config sconfig={value} -> {}",
+                        path.display()
+                    ));
                     if args.verbose {
                         println!("switch config sconfig={value} path={}", path.display());
                     }
@@ -215,7 +233,9 @@ fn watch(args: Options, runtime: Runtime, stop: Arc<AtomicBool>) -> Result<(), S
                     runtime
                         .devices
                         .reset_unused_from(&devices, &active_devices, args.dry_run);
-                    runtime.devices.copy_state_from(&devices);
+                    if !args.dry_run {
+                        reset_cpu_limits(&args.sysfs_root);
+                    }
                     runtime.sensors.copy_state_from(&sensors);
                     let Runtime {
                         algos,
@@ -456,14 +476,16 @@ enum ColorOsPowerMode {
     PowerSaving,
     Balanced,
     HighPerformance,
+    ProGamer,
 }
 
 impl ColorOsPowerMode {
     fn sconfig(self) -> i64 {
         match self {
-            Self::PowerSaving => 5,      // thermal-phone.conf
-            Self::Balanced => 0,         // thermal-normal.conf
-            Self::HighPerformance => 50, // thermal-per-normal.conf
+            Self::PowerSaving => 5,      // thermal-phone.conf (42C)
+            Self::Balanced => 0,         // thermal-normal.conf (46C)
+            Self::HighPerformance => 20, // thermal-yuanshen.conf (48C, no early CPU throttle)
+            Self::ProGamer => 6,         // thermal-nolimits.conf (51C, full uncapped gaming)
         }
     }
 }
@@ -475,6 +497,7 @@ struct ColorOsModeWatcher {
     last_system_mtime: Option<SystemTime>,
     last_global_mtime: Option<SystemTime>,
     high_perf: bool,
+    gt_mode: bool,
     low_power: bool,
     last_mode: Option<ColorOsPowerMode>,
 }
@@ -500,6 +523,7 @@ impl ColorOsModeWatcher {
             last_system_mtime: None,
             last_global_mtime: None,
             high_perf: false,
+            gt_mode: false,
             low_power: false,
             last_mode: None,
         }
@@ -529,7 +553,8 @@ impl ColorOsModeWatcher {
                     let gt = abx_setting_value(&bytes, "gt_mode_state_setting")
                         .as_deref()
                         == Some("1");
-                    self.high_perf = hp || gt;
+                    self.high_perf = hp;
+                    self.gt_mode = gt;
                     changed = true;
                 }
             }
@@ -555,6 +580,8 @@ impl ColorOsModeWatcher {
 
         let mode = if self.low_power {
             ColorOsPowerMode::PowerSaving
+        } else if self.gt_mode {
+            ColorOsPowerMode::ProGamer
         } else if self.high_perf {
             ColorOsPowerMode::HighPerformance
         } else {
