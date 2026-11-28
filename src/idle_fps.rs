@@ -11,9 +11,10 @@ const SF_SERVICE: &str = "SurfaceFlinger";
 const SF_SET_ACTIVE_CONFIG: u32 = 1035;
 
 /// SurfaceFlinger hardware mode IDs on peridot (all group=0, seamless switch):
-/// id=0 -> 60 Hz, id=1 -> 120 Hz, -1 -> release override back to DisplayManager policy.
+/// id=0 -> 60 Hz, id=1 -> 120 Hz, id=2 -> 90 Hz, -1 -> release override back to DisplayManager policy.
 const MODE_IDLE_60HZ: i32 = 0;
 const MODE_ACTIVE_120HZ: i32 = 1;
+const MODE_90HZ: i32 = 2;
 const MODE_RELEASE_OVERRIDE: i32 = -1;
 
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 1500;
@@ -79,6 +80,7 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
     let mut sf = SurfaceFlingerClient::default();
     let mut settings = DisplaySettingsCache::new();
     let mut in_idle_60 = false;
+    let mut applied_locked_mode: Option<i32> = None;
     let mut was_screen_on = is_screen_on();
     let mut last_touch = Instant::now();
     let mut last_state_check = Instant::now() - Duration::from_secs(10);
@@ -105,13 +107,36 @@ fn run(shutdown: &AtomicBool, idle_timeout: Duration) {
                 if let Some(f) = pwrkey_file.as_mut() {
                     drain_fd(f, &mut drain_buf);
                 }
-                if !settings.is_standard_60_only() {
+                if let Some(locked) = settings.locked_mode() {
+                    thread::sleep(Duration::from_millis(120));
+                    if is_screen_on() && sf.set_mode(locked) {
+                        applied_locked_mode = Some(locked);
+                    }
+                } else if !settings.is_standard_60_only() {
                     thread::sleep(Duration::from_millis(120));
                     if is_screen_on() && sf.set_mode(MODE_ACTIVE_120HZ) {
                         let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
                     }
                 }
                 last_touch = Instant::now();
+            }
+
+            if let Some(locked) = settings.locked_mode() {
+                if applied_locked_mode != Some(locked) && is_screen_on() {
+                    if sf.set_mode(locked) {
+                        applied_locked_mode = Some(locked);
+                        in_idle_60 = false;
+                    }
+                }
+                thread::sleep(Duration::from_millis(500));
+                last_touch = Instant::now();
+                last_state_check = Instant::now() - Duration::from_secs(10);
+                continue;
+            } else if applied_locked_mode.is_some() {
+                if is_screen_on() {
+                    let _ = sf.set_mode(MODE_RELEASE_OVERRIDE);
+                }
+                applied_locked_mode = None;
             }
 
             if !settings.should_idle_drop() {
@@ -422,7 +447,7 @@ struct DisplaySettingsCache {
     standard_60_only: bool,
     cosmic_enabled: bool,
     cosmic_timeout_ms: Option<u64>,
-    cosmic_refresh_locked: bool,
+    cosmic_locked_mode: Option<i32>,
 }
 
 impl Drop for DisplaySettingsCache {
@@ -457,7 +482,7 @@ impl DisplaySettingsCache {
             standard_60_only: false,
             cosmic_enabled: true,
             cosmic_timeout_ms: None,
-            cosmic_refresh_locked: false,
+            cosmic_locked_mode: None,
         }
     }
 
@@ -467,15 +492,20 @@ impl DisplaySettingsCache {
             .unwrap_or(default_timeout)
     }
 
+    fn locked_mode(&mut self) -> Option<i32> {
+        self.refresh();
+        self.cosmic_locked_mode
+    }
+
     fn is_standard_60_only(&mut self) -> bool {
         self.refresh();
-        self.standard_60_only || self.cosmic_refresh_locked
+        self.standard_60_only || self.cosmic_locked_mode.is_some()
     }
 
     fn should_idle_drop(&mut self) -> bool {
         self.refresh();
         self.cosmic_enabled
-            && !self.cosmic_refresh_locked
+            && self.cosmic_locked_mode.is_none()
             && !self.high_perf
             && !self.standard_60_only
     }
@@ -505,7 +535,12 @@ impl DisplaySettingsCache {
                                         v.trim().parse::<u64>().ok().filter(|&ms| ms >= 500);
                                 }
                                 "refresh_rate" => {
-                                    self.cosmic_refresh_locked = v.trim() != "auto";
+                                    self.cosmic_locked_mode = match v.trim() {
+                                        "hz60" => Some(MODE_IDLE_60HZ),
+                                        "hz90" => Some(MODE_90HZ),
+                                        "hz120" => Some(MODE_ACTIVE_120HZ),
+                                        _ => None,
+                                    };
                                 }
                                 _ => {}
                             }
